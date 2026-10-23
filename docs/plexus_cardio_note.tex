@@ -222,7 +222,6 @@ $2\times10^{-4}$ for the starting Young's modulus $E = 80$.
 Nothing in \S\ref{sec:mpm} makes a cell move on its own: the material point method only relaxes elastic stress.
 The beat enters as a change of each cell's rest shape, once per frame, written into the deformation gradient of
 the cell's points, and the material law of \S\ref{sec:mpm} turns it into motion during the following sub-steps.
-No force and no velocity are injected.
 
 \textbf{The shared pulse.} One activation curve $\gamma(t)$, $t$ the frame inside the beat (41.7~ms each; 57
 frames per beat for the healthy sheet, 65 for HCM), a sigmoid rise and fall normalised to start at zero:
@@ -331,11 +330,12 @@ everything else zero. One fit takes 108~min
 
 \begin{figure}[!tb]
 \centering
-\includegraphics[width=0.92\linewidth]{figures/frame_overlay.png}
-\caption{Healthy sheet near peak contraction, from the continuous three-beat rollout (every beat is fitted;
-the model is never reset). Left: the microscope frame in green and the rest frame
-warped by the fitted motion in magenta, motion drawn $\times4$; grey where they agree. Right: the 18,769
-tracking nodes (green) and the 56,640 material points (blue), displacement from rest $\times10$.}
+\includegraphics[width=0.86\linewidth]{figures/frame_overlay.png}
+\caption{One frame of \code{docs/cont\_overlay\_particles.mp4} (made by \code{scripts/make\_cont\_overlay\_particles.sh},
+\S\ref{sec:run}): the healthy sheet near peak contraction, beats 1--3 in one rollout that is never reset (every beat is
+fitted). Left: the microscope frame in green and the rest frame warped by the fitted motion in magenta, motion drawn
+$\times4$; grey where they agree. Right: the 18,769 tracking nodes (green) and the 56,640 material points (blue),
+displacement from rest $\times10$.}
 \label{fig:frame}
 \end{figure}
 
@@ -369,26 +369,14 @@ displacements $u$. Every beat is fitted: spread across beats 0.002 (healthy), 0.
 \label{tab:fit}
 \end{table}
 
-The movie \code{docs/cont\_overlay\_particles.mp4} (built by
-\code{scripts/make\_cont\_overlay\_particles.sh}, \S\ref{sec:run}) plays the healthy sheet through beats 1--3 in one
-rollout that is never reset, two views side by side: left the microscope frame in green and the rest frame warped by
-the fitted motion in magenta, motion drawn $\times4$, grey where they agree; right the 18,769 tracking nodes (green) and
-the 56,640 material points (blue), displacement $\times10$. Fig.~\ref{fig:frame} is one frame of it. Then the two
-sheets, one dish per condition: Fig.~\ref{fig:sheets} the fitted maps per cell ($g$, $\delta$, $\log E$, $g_2$) and the
-fitted pulse against the recorded mean shortening, Fig.~\ref{fig:axes} the fibre axes, Table~\ref{tab:sheets} the
-numbers.
-
-The recording gives motion, not force, so the fit cannot separate a cell's stiffness from its active strain: a
-stiffer cell that contracts harder, or a weaker contraction held for longer, moves the sheet the same way. With
-planted parameters (the recording's rest-frame noise added, 3 seeds) the fit recovers $g$ to 0.10 of its spread
-($r = 0.93$) and $\varphi$ to $5^\circ$, but $\log E$ only to 0.40 of its spread ($r \approx 0.65$); left free on the
-real data the per-cell $E_j$ spreads over a factor of 200, and the shrinkage $\lambda_E = 0.3$ (the weight of the mean
-squared deviation of $\log E_j$ from its mean, added to the loss) holds it to $\pm12\%$ at a cost of 0.04 in explained
-variance. The pulse length and the gain trade off in the same way. The healthy / HCM differences of
-Table~\ref{tab:sheets} therefore describe one dish of each, fitted under one choice of prior; they are not a
-conclusion about the two conditions. That needs a post-processing of the fitted maps that reads what the trade-off
-does not touch (the realised per-cell shortening, the delays, the fibre-axis order, which come from the motion
-itself), and fits on more than one dish per condition.
+\Needspace{8\baselineskip}
+The recording gives motion, not force, so the fit cannot separate a cell's stiffness from its active strain: a stiffer
+cell that contracts harder, or a weaker contraction held for longer, moves the sheet the same way. On planted
+parameters (the recording's rest-frame noise added, 3 seeds) the fit recovers $g$ to 0.10 of its spread ($r = 0.93$)
+and $\varphi$ to $5^\circ$, but $\log E$ only to 0.40 ($r \approx 0.65$). On the real data the per-cell $E_j$, left
+free, spreads over a factor of 200; the shrinkage $\lambda_E = 0.3$ holds it to $\pm12\%$ at a cost of 0.04 in
+explained variance. The pulse length and the gain trade off likewise. The healthy / HCM differences of
+Table~\ref{tab:sheets} therefore describe one dish of each under one prior, not a conclusion about the two conditions.
 
 \begin{figure}[!tb]
 \centering

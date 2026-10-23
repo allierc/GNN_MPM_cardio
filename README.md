@@ -28,6 +28,7 @@ may be claimed. `PROVENANCE.md` lists every file against its origin.
 | `reference/` | the reporting fits as produced in Plexus: `fit.json` (config + per-iteration loss), `params.npz` (every learnable), `s4_score.json` |
 | `tools/compare_fits.py` | loss log, parameters and scores of two fit directories side by side, with a tolerance verdict |
 | `parity/` | the record of rerunning both fits from this repository against the Plexus tree |
+| `docs/` | the note `plexus_cardio_note.pdf` with its source and figures; `cont_overlay_particles.mp4`, the healthy fit against the recording over beats 1-3 in one rollout (made by `scripts/make_cont_overlay_particles.sh`) |
 
 ## Install
 

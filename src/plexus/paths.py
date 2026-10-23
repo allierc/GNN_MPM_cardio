@@ -1,0 +1,319 @@
+"""Data-root, config, and pre-folder resolution (mirrors connectome-gnn's utils).
+
+Plexus keeps three roots:
+  * the **repo** holds `config/<pre_folder>/<name>.yaml` (the specs, version-controlled);
+  * the **data root** holds `graphs_data/<pre_folder>/<name>/` (generated trajectories)
+    and `log/<pre_folder>/<name>/` (run logs);  set with `--output_root` /
+    `$PLEXUS_OUTPUT_ROOT` / `$GNN_OUTPUT_ROOT` (no default in code: its location is local).
+
+The **pre-folder** is the simulation *type* (interaction / boids / mpm / divide ...).
+It is inferred from the config name -- the way the prototype scenarios were named
+("attraction_repulsion", "tissue_two_types_mpm", "divide_cell") -- so a bare
+`-o generate attraction_repulsion` routes to `config/interaction/...` and writes to
+`graphs_data/interaction/...`. A name containing a `/` names its folder explicitly.
+"""
+from __future__ import annotations
+
+import os
+
+# --------------------------------------------------------------------------- #
+#  data root (graphs_data/ + log/)
+# --------------------------------------------------------------------------- #
+# No default in code: the shared data area is a local setting (this repo is public).
+_data_root = os.environ.get("PLEXUS_OUTPUT_ROOT") or os.environ.get("GNN_OUTPUT_ROOT") or ""
+
+
+def warn(msg: str) -> None:
+    """Print a `[warn]` line in yellow, so it is not read as ordinary progress.
+
+    WHY IT MATTERS HERE. The warning "property 'material' on nucleus.n is read by no operator" was
+    correct for weeks and was the ONLY notice that a child set asking to be a liquid was silently
+    building as whatever its parent cell was. It scrolled past in the same white as the banner, the
+    operator list and the progress bar, and nobody read it -- the bug was eventually found by
+    measuring `mu` and `is_liquid` by hand. A warning that looks like progress is not a warning.
+
+    COLOUR ONLY ON A TERMINAL. `sys.stdout.isatty()` is False for a cluster job's redirected
+    output, and an escape sequence in a log file is noise a grep has to strip.
+    """
+    import sys
+    on = "\033[33m" if sys.stdout.isatty() else ""
+    off = "\033[0m" if sys.stdout.isatty() else ""
+    print(f"{on}{msg}{off}", flush=True)
+
+
+def get_data_root() -> str:
+    if not _data_root:
+        raise RuntimeError("no data root: pass --output_root or set PLEXUS_OUTPUT_ROOT / GNN_OUTPUT_ROOT")
+    return _data_root
+
+
+def set_data_root(path: str) -> None:
+    """Set the root under which graphs_data/ and log/ live (call early in main)."""
+    global _data_root
+    _data_root = path
+
+
+def graphs_data_path(*parts: str) -> str:
+    """`graphs_data_path('interaction', 'ar') -> {data_root}/graphs_data/interaction/ar`"""
+    return os.path.join(get_data_root(), "graphs_data", *parts)
+
+
+def log_path(*parts: str) -> str:
+    """`log_path('interaction', 'ar') -> {data_root}/log/interaction/ar`"""
+    return os.path.join(get_data_root(), "log", *parts)
+
+
+def get_repo_root() -> str:
+    # this file is src/plexus/paths.py -> repo root is three levels up
+    return os.path.normpath(os.path.join(os.path.dirname(__file__), "..", ".."))
+
+
+def config_path(*parts: str) -> str:
+    """`config_path('interaction', 'ar.yaml') -> {repo}/config/interaction/ar.yaml`.
+    Configs always load from the repo (version-controlled), never the data root;
+    use an absolute path to load a spec from elsewhere."""
+    return os.path.join(get_repo_root(), "config", *parts)
+
+
+def training_specs(pattern: str = "*") -> list[str]:
+    """Every training spec whose name matches `pattern`, across `config/training/<model>/`.
+
+    The folder says WHAT IS TRAINED -- `neural` (a circuit alone), `neural_eye` (a circuit driving
+    the eye) -- and the file name says which run, so a caller names the run, not the folder."""
+    import glob
+    return sorted(glob.glob(config_path("training", "*", f"{pattern}.yaml")))
+
+
+def training_spec(name: str) -> str:
+    """A training spec by name: `m1_integrate_zf285` -> `config/training/neural/m1_integrate_zf285.yaml`.
+    A path (anything ending in `.yaml`) is returned as given. A name found in two model folders
+    is refused rather than resolved to whichever the glob listed first."""
+    if name.endswith(".yaml"):
+        return name
+    hits = training_specs(name)
+    if len(hits) != 1:
+        raise FileNotFoundError(
+            f"training spec {name!r}: {len(hits)} match(es) under {config_path('training')}"
+            + (f": {hits}" if hits else "") + ". A name must be unique across the model folders.")
+    return hits[0]
+
+
+# --------------------------------------------------------------------------- #
+#  pre-folder (simulation type) inference
+# --------------------------------------------------------------------------- #
+# Ordered (folder, trigger-substrings). First folder whose any trigger appears
+# in the config name wins. Grow this as new simulation types are added.
+_PRE_FOLDER_RULES: list[tuple[str, tuple[str, ...]]] = [
+    ("attraction_repulsion", ("attraction_repulsion", "attract", "repuls", "arbitrary")),
+    ("inverse_square", ("inverse_square", "coulomb", "electro", "charge", "nbody", "galaxy", "spiral")),
+    ("attractors",  ("attractor", "lorenz", "halvorsen", "aizawa", "sprott", "thomas",
+                     "rossler", "dadras", "chen", "chua", "rabinovich")),
+    ("boids",       ("boids", "flock", "swarm")),
+    ("slime",       ("slime", "physarum", "trail")),
+    ("material",    ("material",)),
+    # The SI family lives apart from `material/` because the two are not interchangeable: an
+    # si_material spec declares metres, seconds and pascals via `general.units`, and a material one
+    # declares nothing. Sharing a folder made `si_` a prefix doing a directory's job. Listed BEFORE
+    # any rule that could match on a substring of the name, and matched by folder anyway.
+    ("si_material", ("si_material", "si_water", "si_fill", "si_splash", "si_gate")),
+    # WHERE THE STUDIO PUTS WHAT IT WRITES. `plexus.gui.studio` authors specs from a prompt, and
+    # they must land somewhere `Plexus_Main.py` will actually run: `validate_pre_folder` admits only
+    # a known simulation TYPE, so an unregistered folder is refused before anything renders. Kept
+    # separate from `material/` and `si_material/` because these are drafts -- generated, edited in
+    # the browser, and thrown away -- and mixing them into a curated family would make the family
+    # untrustworthy.
+    ("studio",      ("studio",)),
+    # THE PLATYNEREIS LADDER. A whole-animal family: the anatomy of a three-day nectochaete larva
+    # from Veraszto et al. (2025) eLife RP97964, its measured connectome, the activity that
+    # connectome supports, and the ciliary beat that activity drives. Registered here for the same
+    # reason the promotion's folders were -- `validate_pre_folder` admits only a known simulation
+    # TYPE, so an unregistered folder cannot be run by `Plexus_Main.py` at all, and the alternative
+    # is a private runner that makes the core's own path untested on this work.
+    ("platynereis", ("platynereis", "plat")),
+    # THE DEMO LADDER (builder/exp_03_cell_tissue): a presentation built one addition per slide --
+    # cells, then a morphogen, then diffusion, then reaction, then the minisite's variants. Its specs
+    # were only ever run through the GUI, which copies every spec into `studio/` first, so the folder
+    # was never checked; the first time its slides went to `gpu_l4` through `Plexus_Main.py` directly,
+    # both jobs died at `validate_pre_folder` before building anything. Matched by folder only: no
+    # spec NAME should be claimed by it, since `d4_...` and `a2_...` mean nothing outside the ladder.
+    ("demo",        ()),                     # no triggers: valid as a folder, claims no bare name
+    ("active_matter", ("active_matter", "vicsek", "flock_am")),
+    ("mpm",         ("mpm", "tissue", "elastic", "soft")),
+    ("divide",      ("divide", "grow", "mitosis", "morula")),
+    ("forage",      ("forage", "maze", "race", "graze")),
+    ("gravity",     ("gravity",)),
+    # THE PROMOTION'S THREE FOLDERS, added because the CLI refused them and the refusal was correct:
+    # `validate_pre_folder` only admits a known simulation TYPE, and a folder that is not on this
+    # list cannot be run by `Plexus_Main.py` at all. The atlas campaigns used to work around it
+    # with their own `run_spec.py`; the promotion should not, because the whole point is that the
+    # core runs these.
+    #   promotion  the twin-run gate's specs (tools/promotion_identical.py)
+    #   gates      the okuda_ECM gates 00-04, lifted out of their scripts into declared specs
+    #   atlas      the minisite scenes rebuilt in the promoted vocabulary
+    # No trigger substrings: these are named by folder (`promotion/<name>`), never inferred from a
+    # config name, because inferring "gates" from a name containing "gate" is how a spec ends up in
+    # a folder nobody chose.
+    ("promotion",   ()),
+    ("gates",       ()),
+    ("atlas",       ()),
+    # THE MESH-MPM INTERACTION LADDER. A prescribed vertex surface pressed into an MPM continuum
+    # through `mesh_contact` -- the one coupling in the promoted vocabulary that neither the gates
+    # nor the corpus exercise on anything but a growing sphere. No trigger substrings, for the same
+    # reason the three above have none: `mesh` and `mpm` both appear in names all over the corpus,
+    # and inferring this folder from either would sweep vertex and material specs into a directory
+    # nobody chose. Named by folder: `mesh_mpm/<name>` -- or by the ANCHORED trigger below.
+    #
+    # `^mesh_mpm` IS SAFE WHERE A BARE `mesh` OR `mpm` WOULD NOT BE. An anchored trigger matches
+    # only at position 0, so it claims exactly the names this folder's specs already carry and
+    # nothing else; the hazard the paragraph above describes is SUBSTRING matching, which this is
+    # not. Without it `mesh_mpm_sheet_elastic` matched `mpm` at position 5 and resolved to
+    # `config/mpm/`, a folder that does not exist on disk -- so the bare name could not be run at
+    # all, and the error named a missing directory rather than the rule that sent it there.
+    ("mesh_mpm",    ("^mesh_mpm",)),
+    # THE MYOSIN HETEROGENEITY LADDER. A spheroid whose two halves are given different myosin drive
+    # (`junction_myosin.activity_split`), to see what a contractility boundary does to a closed
+    # epithelium. ANCHORED, like `^mesh_mpm` and for a sharper reason: three specs already carry
+    # `myosin` in their names (`gate_01_nomyosin`, and two promotion twins of it), and a substring
+    # trigger would pull all three out of the folders they belong to.
+    ("myosin_mesh", ("^myosin_mesh",)),
+    # THE VERTEX-MODEL ENERGY COMPARISON, named for the QUESTION and not for one of its answers.
+    # It was `marinari`, which forced every spec to carry that prefix -- so the Farhadifar runs were
+    # named after the other paper (`marinari_perim_c100` WAS the Farhadifar one) and the folder
+    # asserted a conclusion the comparison exists to test. ANCHORED, like the three above.
+    ("vertex_energy", ("^vertex_energy",)),
+    # THE COMPOSED-CELL LADDER -- a cell built from heterogeneous substrates, a nucleus, a cytosol
+    # of two protein species, a membrane, each its own contained set (appendix "Making a cell in
+    # Plexus"). That ladder is gone; the
+    # rule stays because it costs nothing and a spec named `cell_...` still has to land somewhere
+    # rather than in the default folder; no trigger SUBSTRING was ever used here, because `cell`
+    # appears in half the corpus and would sweep every vertex-model spec into a directory nobody
+    # chose.
+    ("cell",        ("^cell_",)),
+    # THE TISSUE FOLDER -- the epithelium itself, written in the plexus2 spelling.
+    #
+    # WHY IT EXISTS SEPARATELY FROM `config/okuda/`. That folder is a 1,256-spec CAMPAIGN ARCHIVE:
+    # its specs are the record of what a search tried, they carry the spellings of the day they were
+    # written, and rewriting them costs the archive its own provenance. `config/tissue/` is the
+    # opposite kind of folder -- a small, hand-kept set of the runs the promotion is actually
+    # measured on, each in the CURRENT form: seeds in a `seed:` section, canonical operator names,
+    # hypotheses on the `model:` axis, no `mode:` and no seed window.
+    #
+    # NO TRIGGER SUBSTRINGS, deliberately, and for the reason `cell` has none: these specs are named
+    # for the experiment rather than for the folder, and any substring
+    # short enough to match them would sweep half the corpus. They are addressed explicitly as
+    # `tissue/<name>`, which `add_pre_folder` honours through its `"/" in config_name` branch.
+    ("tissue",      ()),
+    # THE NEURAL FOLDER. Recurrent circuits: a `neuron` set, a `synapse` edge-set carrying the
+    # connectivity matrix, and the assemblies that contain them (`operators/neural.py`). Trigger
+    # substrings are given because these specs are named for what they model -- `ctrnn_*`,
+    # `assemblies_*` -- rather than for the folder, unlike the three above.
+    ("neural",      ("neural", "ctrnn", "assemblies", "connectome")),
+    ("metabolism",  ("metabol", "massaction", "stoich")),
+    # MEMBRANE PORES AND CHANNELS (experiments/exp04_membrane_channels): a protein's alpha carbons
+    # in a bead bilayer, the electrolyte as a conductor. No trigger substrings, like `tissue`: the
+    # specs are `channel/exp04_v<K><s>`, addressed explicitly.
+    ("channel",     ()),
+    # A WATER BALLOON SHOT BY A BULLET (experiments/exp22_water_balloon): MPM water and a triangulated
+    # rubber skin on two grids, a rigid projectile. Addressed explicitly, `balloon/exp22_v<K>`.
+    ("balloon",     ()),
+    # A FROG EGG CLEAVING (experiments/exp23_frog_cleavage): one egg of MPM cells dividing into many.
+    # Addressed explicitly, `embryo/exp23_v<K>`.
+    ("embryo",      ()),
+]
+_VALID_PRE_FOLDERS = {f for f, _ in _PRE_FOLDER_RULES}
+
+
+def validate_pre_folder(pre_folder: str) -> None:
+    """The folder a spec sits in must name a simulation type -- and may then say more.
+
+    A TYPE MAY HAVE SUBFOLDERS. `config/si_material/seeder/s0_a.yaml` is a si_material spec kept
+    in a drawer, and refusing it forced every scene of a series into one flat folder beside two
+    hundred others. The FIRST segment is the type (it decides the output tree and the loaders);
+    the rest is filing, and travels with the run so `graphs_data/si_material/seeder/s0_a` mirrors
+    where the spec lives.
+    """
+    if not pre_folder:
+        return
+    name = pre_folder.rstrip("/").split("/", 1)[0]
+    assert name in _VALID_PRE_FOLDERS, (
+        f"pre_folder {pre_folder!r} is not a known simulation type "
+        f"(expected one of: {', '.join(sorted(_VALID_PRE_FOLDERS))})")
+
+
+def add_pre_folder(config_name: str) -> tuple[str, str]:
+    """Map a bare config name to (`<pre_folder>/<name>`, `<pre_folder>/`).
+
+    Idempotent: a name that already contains `/` is taken to name its folder
+    explicitly (the parent), so re-prefixing is avoided."""
+    if "/" in config_name:
+        head = config_name.split("/", 1)[0]
+        return config_name, head + "/"
+    low = config_name.lower()
+    # leftmost trigger wins: the type keyword leads the name, so `slime_two_attract`
+    # routes to slime (`slime` at pos 0), not attraction_repulsion (`attract` at pos 10).
+    # A TRIGGER STARTING WITH `^` IS ANCHORED: it matches only at position 0. Substring matching
+    # alone cannot express "this folder owns names that BEGIN with this", and for `cell` it has to:
+    # a bare `cell_` trigger also matches `saturating_cell_growth`, where it sits at position 11 and
+    # beats that spec's real trigger `grow` at 16, so leftmost-wins would route a division spec into
+    # the cell folder. `^cell_` matches the ladder's `cell_00_...` names and nothing else.
+    best = None                                    # (position, folder)
+    for folder, triggers in _PRE_FOLDER_RULES:
+        hits = [0 for t in triggers if t.startswith("^") and low.startswith(t[1:])]
+        hits += [low.find(t) for t in triggers if not t.startswith("^") and t in low]
+        if hits and (best is None or min(hits) < best[0]):
+            best = (min(hits), folder)
+    if best is not None:
+        return os.path.join(best[1], config_name), best[1] + "/"
+    raise ValueError(
+        f"cannot infer a simulation type (pre-folder) from config name {config_name!r}; "
+        f"known types: {', '.join(sorted(_VALID_PRE_FOLDERS))}. "
+        f"Either rename the config to contain a type keyword, pass it as "
+        f"'<type>/{config_name}', or add a rule in plexus.paths._PRE_FOLDER_RULES.")
+
+
+def resolve_run(name: str) -> str:
+    """Where a FINISHED run's outputs live: `cell/adh_jelly_x10` -> its `graphs_data` directory.
+
+    The mirror of `resolve_config`, and it exists for the same reason: a spec should name a run the
+    way it names a config -- `<type>/<name>` -- and not carry an absolute path that is true on one
+    machine. Accepts the same three forms:
+
+        an absolute or relative directory      taken as-is
+        `<pre_folder>/<name>`                  the folder is named explicitly
+        `<name>`                               the folder is inferred, as for a config
+
+    Raises rather than returning a missing directory, because a spec that loads a run which is not
+    there should fail at load and not several hundred frames into a simulation of nothing.
+    """
+    if os.path.isdir(name):
+        return os.path.abspath(name)
+    rel, _pre = add_pre_folder(name) if "/" not in name else (name, None)
+    path = graphs_data_path(*rel.split("/"))
+    if not os.path.isdir(path):
+        raise FileNotFoundError(
+            f"run {name!r} is not at {path}. `resolve_run` looks under "
+            f"{get_data_root()}/graphs_data; pass an absolute directory, or set --output_root / "
+            f"$PLEXUS_OUTPUT_ROOT to the root that holds it.")
+    return path
+
+
+def resolve_config(config_name: str) -> tuple[str, str, str]:
+    """Resolve a CLI config argument to (yaml_file, pre_folder, name).
+
+    Accepts an absolute/relative filesystem path (folder = parent dir) or a
+    repo-relative bare/`type/`-prefixed name (folder inferred / explicit)."""
+    if os.path.isfile(config_name) or os.path.isabs(config_name) or config_name.endswith(".yaml"):
+        yaml_file = config_name if config_name.endswith(".yaml") else config_name + ".yaml"
+        # THE FOLDER IS EVERYTHING UNDER `config/`, not just the last segment: a spec kept in
+        # `config/si_material/seeder/` is a si_material spec in a drawer, and taking only the
+        # parent read the drawer's name as the type and refused to run it.
+        _d = os.path.dirname(os.path.abspath(yaml_file))
+        _root = os.path.abspath(config_path(""))
+        pre_folder = (os.path.relpath(_d, _root) if _d.startswith(_root + os.sep) or _d == _root
+                      else os.path.basename(_d)) + "/"
+        name = os.path.splitext(os.path.basename(yaml_file))[0]
+        return yaml_file, pre_folder, name
+    rel, pre_folder = add_pre_folder(config_name)
+    yaml_file = config_path(f"{rel}.yaml")
+    name = os.path.basename(rel)
+    return yaml_file, pre_folder, name

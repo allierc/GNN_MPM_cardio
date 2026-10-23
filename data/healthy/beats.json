@@ -1,0 +1,52 @@
+{
+ "onsets": [
+  2,
+  51,
+  101,
+  152,
+  204
+ ],
+ "gaps": [
+  49,
+  50,
+  51,
+  52
+ ],
+ "complete_spans": [
+  [
+   2,
+   51
+  ],
+  [
+   51,
+   101
+  ],
+  [
+   101,
+   152
+  ],
+  [
+   152,
+   204
+  ]
+ ],
+ "fit_span": [
+  152,
+  204
+ ],
+ "heldout_spans": [
+  [
+   2,
+   51
+  ],
+  [
+   51,
+   101
+  ],
+  [
+   101,
+   152
+  ]
+ ],
+ "note": "speed-peak onsets of the healthy recording (239 frames, 24 fps); recording.beat_window turns them into rest-referenced windows"
+}

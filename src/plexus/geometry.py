@@ -1,0 +1,106 @@
+"""Geometry helpers shared by the engine and operators: minimum-image
+displacement and a blockwise radius neighbour graph.
+
+Kept here (package level, not in an operator file) because both the edge builder
+and any pairwise operator need the same boundary-aware displacement, and the
+engine may want it too.
+"""
+from __future__ import annotations
+
+import torch
+
+
+def minimum_image(d: torch.Tensor, periodic: bool, world=1.0) -> torch.Tensor:
+    """Wrap a displacement `d[..., D]` to its nearest periodic image (no-op when not
+    periodic). `world` is the per-axis box size: a scalar keeps the legacy 2D torus
+    [0,W] x [0,1] (x wraps by W, y by 1); a length-D vector wraps each axis by its own
+    size -- the dimension-generic form. Used for both the edge cutoff and the force
+    direction, so they agree."""
+    if not periodic:
+        return d
+    if d.shape[-1] == 2 and not torch.is_tensor(world) and not isinstance(world, (list, tuple)):
+        W = float(world)                                   # legacy 2D: [0,W] x [0,1]
+        dx = d[..., 0] - W * torch.round(d[..., 0] / W)
+        dy = d[..., 1] - torch.round(d[..., 1])
+        return torch.stack([dx, dy], dim=-1)
+    W = torch.as_tensor(world, device=d.device, dtype=d.dtype)   # [D] per-axis box size
+    if bool((W == 1).all()):                                      # unit box: skip the /W and *W passes
+        return d - torch.round(d)                                #   (two fewer full-tensor kernels)
+    return d - W * torch.round(d / W)
+
+
+def neighbour_mean(pos, occ, edge_index, periodic, world, msg_fn) -> torch.Tensor:
+    """Mean over each receiver i's live neighbours j of `msg_fn(i, j, d_ij)` -> [N, D].
+
+    `edge_index` is [2, E] (row0 receiver i, row1 neighbour j); `d_ij = pos_j - pos_i`
+    is the minimum-image displacement. The shared reduction behind the boids steering
+    rules (cohesion / alignment / separation). Dimension-generic: output width = D =
+    pos.shape[-1].
+    """
+    N, D = pos.shape[0], pos.shape[-1]
+    if edge_index.numel() == 0:
+        return torch.zeros(N, D, device=pos.device)
+    i, j = edge_index[0], edge_index[1]
+    d = minimum_image(pos[j] - pos[i], periodic, world)
+    msg = msg_fn(i, j, d) * occ[j, None]                    # ignore dormant neighbours
+    acc = torch.zeros(N, D, device=pos.device).index_add_(0, i, msg)
+    deg = torch.zeros(N, device=pos.device).index_add_(0, i, occ[j])
+    return (acc / deg.clamp(min=1.0)[:, None]) * occ[:, None]
+
+
+def _radius_block_mask(pos_i, pos_all, min2, max2, gi, jidx, periodic, world):
+    """Per-block radius mask [B, N]: True where min2 < |pos_i - pos_all|^2 < max2 and j > i.
+    Pure tensors, so a fusing backend can collapse the diff/square/reduce/compare into one
+    kernel and never materialise the [B, N, D] difference; whether that happens is the
+    engine's `compile:` decision, not this function's. The dynamic edge extraction
+    (`.nonzero()`) stays OUTSIDE, eager."""
+    d = minimum_image(pos_i[:, None, :] - pos_all[None, :, :], periodic, world)
+    dist2 = (d * d).sum(-1)                                  # [B, N]
+    return (dist2 > min2) & (dist2 < max2) & (jidx > gi)     # radius rule + upper triangle
+
+
+def edges_radius_blockwise(
+    pos: torch.Tensor,
+    occ: torch.Tensor,
+    r_min: float,
+    r_max: float,
+    periodic: bool = False,
+    world_width=1.0,
+    block: int = 2048,
+) -> torch.Tensor:
+    """Bidirectional edge_index [2, E] for live pairs with `r_min < dist < r_max`,
+    built blockwise so the O(N^2) distance matrix is never materialised (scales to
+    1e4-1e5 nodes). Row 0 = receiver i, row 1 = neighbour j; every pair appears in
+    both directions. Ported from ParticleGraph's edges_radius_blockwise.
+
+    The occupancy filter runs ONCE over the surviving edge list (O(E),
+    `live[row] & live[col]`) rather than as two `[B, N]` boolean reductions inside
+    the block loop -- the live/live mask only ever drops pairs touching a dormant
+    node, so the post-loop filter gives the identical edge set at lower cost.
+    Boundary handling goes through `minimum_image` (periodic 2D/3D, free; scalar or
+    per-axis world all supported).
+    """
+    device = pos.device
+    N = pos.shape[0]
+    min2, max2 = r_min * r_min, r_max * r_max
+    jidx = torch.arange(N, device=device)[None, :]          # [1, N]
+
+    rows, cols = [], []
+    for i0 in range(0, N, block):
+        i1 = min(i0 + block, N)
+        gi = torch.arange(i0, i1, device=device)[:, None]   # [B, 1] global i
+        m = _radius_block_mask(pos[i0:i1], pos, min2, max2, gi, jidx,
+                               periodic, world_width)       # [B, N] radius+triangle mask
+        ii, jj = m.nonzero(as_tuple=True)                   # dynamic edge extraction stays eager
+        rows.append(ii + i0); cols.append(jj)
+        del m
+
+    row = torch.cat(rows) if rows else torch.empty(0, dtype=torch.long, device=device)
+    col = torch.cat(cols) if cols else torch.empty(0, dtype=torch.long, device=device)
+
+    live = occ > 0                                          # drop pairs touching a dormant node
+    keep = live[row] & live[col]                            # O(E), once over the edge list
+    row, col = row[keep], col[keep]
+
+    eij = torch.stack([row, col], 0)                        # [2, E_half]  (i, j) with j > i
+    return torch.cat([eij, eij.flip(0)], 1).contiguous()    # mirror -> both directions

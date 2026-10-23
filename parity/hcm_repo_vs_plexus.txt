@@ -1,0 +1,23 @@
+loss log: 250 common iterations (A has 250, B 250)
+  it 0      A 1.566417933  B 1.566416979  |dL|/L 6.09e-07
+  it 249   A 0.153618157  B 0.153601557  |dL|/L 1.08e-04
+  max |dL|/L over the log: 1.34e-04 at iteration 234
+parameters (max |dp| / spread of A's map):
+  amode      max|dp| 5.680e-01  rms 2.677e-02  spread(A) 6.802e-01  rel 8.35e-01
+  clock      max|dp| 1.276e-03  rms 6.646e-04  spread(A) 3.283e+00  rel 3.89e-04
+  delay      max|dp| 1.601e-01  rms 1.184e-02  spread(A) 2.634e+00  rel 6.08e-02
+  g          max|dp| 4.568e-03  rms 2.703e-04  spread(A) 4.347e-02  rel 1.05e-01
+  g2         max|dp| 2.366e-03  rms 2.816e-04  spread(A) 5.285e-02  rel 4.48e-02
+  logE       max|dp| 2.428e-02  rms 1.595e-03  spread(A) 8.772e-02  rel 2.77e-01
+  logdur     max|dp| 6.525e-02  rms 3.929e-03  spread(A) 3.662e-01  rel 1.78e-01
+  logkappa   max|dp| 3.186e-03  rms 4.992e-04  spread(A) 1.372e-01  rel 2.32e-02
+  logtau     max|dp| 2.894e-02  rms 2.870e-03  spread(A) 1.198e-01  rel 2.41e-01
+  logtr      max|dp| 9.808e-02  rms 5.140e-03  spread(A) 1.195e-01  rel 8.20e-01
+  phi        max|dp| 2.629e-02  rms 2.765e-03  spread(A) 1.086e+00  rel 2.42e-02
+  psi        max|dp| 3.976e-03  rms 1.210e-03  spread(A) 1.952e-01  rel 2.04e-02
+scores (model R^2, A = strain maps, u = displacements):
+  beat 1: R2(A) 0.893807 vs 0.893805 (d 2.0e-06)   R2(u) 0.949159 vs 0.949171 (d 1.2e-05)
+  beat 2: R2(A) 0.899995 vs 0.899988 (d 6.7e-06)   R2(u) 0.957697 vs 0.957708 (d 1.2e-05)
+  beat 3: R2(A) 0.897646 vs 0.897637 (d 8.5e-06)   R2(u) 0.958033 vs 0.958059 (d 2.7e-05)
+  beat 4: R2(A) 0.898145 vs 0.898138 (d 6.8e-06)   R2(u) 0.958364 vs 0.958385 (d 2.1e-05)
+verdict: worst relative difference 8.35e-01 > tol 1e-05 -> DIFFERENT beyond tolerance

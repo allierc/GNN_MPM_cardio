@@ -1,0 +1,18 @@
+loss log: 3 common iterations (A has 3, B 3)
+  it 0      A 1.778043985  B 1.778043866  |dL|/L 6.70e-08
+  it 2     A 1.480093002  B 1.480091333  |dL|/L 1.13e-06
+  max |dL|/L over the log: 1.13e-06 at iteration 2
+parameters (max |dp| / spread of A's map):
+  amode      max|dp| 1.467e-04  rms 5.200e-06  spread(A) 1.095e-01  rel 1.34e-03
+  clock      max|dp| 3.958e-05  rms 2.594e-05  spread(A) 2.912e+00  rel 1.36e-05
+  delay      max|dp| 1.213e-03  rms 6.323e-05  spread(A) 1.941e-01  rel 6.25e-03
+  g          max|dp| 4.400e-06  rms 2.798e-07  spread(A) 3.921e-03  rel 1.12e-03
+  g2         max|dp| 9.506e-07  rms 9.606e-08  spread(A) 3.477e-03  rel 2.73e-04
+  logE       max|dp| 6.056e-05  rms 5.767e-06  spread(A) 1.088e-01  rel 5.57e-04
+  logdur     max|dp| 3.367e-05  rms 4.059e-06  spread(A) 9.403e-02  rel 3.58e-04
+  logkappa   max|dp| 7.494e-05  rms 4.877e-06  spread(A) 9.051e-02  rel 8.28e-04
+  logtau     max|dp| 6.953e-05  rms 7.239e-06  spread(A) 8.971e-02  rel 7.75e-04
+  logtr      max|dp| 1.794e-04  rms 1.693e-05  spread(A) 8.796e-02  rel 2.04e-03
+  phi        max|dp| 3.505e-05  rms 5.115e-06  spread(A) 8.755e-01  rel 4.00e-05
+  psi        max|dp| 2.072e-05  rms 2.058e-06  spread(A) 8.921e-02  rel 2.32e-04
+verdict: worst relative difference 6.25e-03 > tol 1e-05 -> DIFFERENT beyond tolerance

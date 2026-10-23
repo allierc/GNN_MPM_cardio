@@ -1,0 +1,2953 @@
+"""The generic engine: build a Hierarchy from a validated spec, seed it, run
+the dynamics schedule. Three lifecycle phases, in order:
+
+    build(sim)          -- allocate every set/field the spec declares (+ the
+                            spec-level `sets:` placement/velocity/type/edge
+                            keys -- see `build`'s own docstring for why those
+                            stay data the engine interprets, not operators)
+    seed(H, sim)         -- run `sim.seed_ops` (the seed: section) EXACTLY
+                            ONCE: x_0 = S(theta_S). Not a loop, not gated by
+                            frame number -- there is no frame number yet.
+    run(sim)             -- calls build() then seed() then iterates the
+                            dynamics schedule: x_{t+1} = Phi(x_t; theta_D).
+
+This is the *interpreter* of the spec language. It contains NO spec-specific
+logic beyond that split. Every DYNAMICS operator is dispatched the same way
+(by name); the engine never special-cases a kind within `run`'s schedule loop.
+The seven dynamics kinds split by what they touch: the set-dynamics kinds
+(lateral / aggregate / broadcast / exchange) return a per-level delta the engine
+sums and integrates once per tick (order -- 1st vs 2nd derivative -- from each
+operator's `EMIT`); `field` operators mutate a field in place; `rewire`
+rebuilds a relation; `structural` changes the entity set. The eighth kind,
+`seed`, is not dispatched by `run` at all -- see `seed()` below. The
+integration invariant -- only `_integrate` writes pos/vel, unless an operator
+declares `MAY_MUTATE_INTEGRATED_STATE` (seed / structural / derived-readout) --
+is enforced per operator on frame 0 of whichever phase runs it.
+
+LEGACY COMPATIBILITY. A `kind="seed"` operator declared the pre-`seed:` way
+(under `operators:`, referenced in `schedule:`) is still accepted: `run`'s
+`_seed_window`/`_gate` mechanism, unchanged, still confines it to the opening
+frames. `schema.py` warns this spelling is deprecated; it is not yet rejected,
+per the migration order in notes/campaigns/SEED_MIGRATION.md. New specs should use `seed:`.
+"""
+from __future__ import annotations
+
+import contextlib
+import time
+import os
+import math
+import numpy as np
+import torch
+from torch import nn
+
+# BIT-REPRODUCIBLE RUNS ARE NOW OPT-IN, and the reason is a measured factor of 4.4 on a real spec.
+#
+# Set unconditionally, `torch.use_deterministic_algorithms(True)` makes every run in the repo pay
+# for reproducibility whether or not anything is comparing two runs.
+# The flag reroutes CUDA `index_add_` / `scatter_add_` from atomics to a sort-and-segment kernel
+# whose cost is driven by the longest run of DUPLICATE indices. Measured on an RTX A6000:
+#
+#   index_add_ of [570760, 3] into [1, 3]     deterministic 140.98 ms    atomics 1.00 ms   141x
+#   si_waterfall, whole frame, warp path      deterministic  245.2 ms    atomics  55.3 ms  4.43x
+#   si_waterfall, whole frame, torch path     deterministic 1374.9 ms    atomics 985.7 ms  1.39x
+#
+# -- and the aggregate alone was 84% of the warp frame. Nothing in the corpus asked for this: of
+# 2,456 specs, ZERO declare determinism (the three files that match the word are comments about
+# kT = 0 and noise-free steering). The only callers that need it are the promotion gate and the
+# gate runner, and both already export `PLEXUS_STRICT_DETERMINISM=1` -- so the setting now follows
+# the thing that actually wants it instead of taxing everything that does not.
+#
+# STRICT MEANS STRICT: `warn_only=False`. With `warn_only=True` a kernel with no deterministic
+# implementation warns once and runs the nondeterministic path anyway, so a run could be
+# irreproducible while this line claimed otherwise. That lenient middle setting is the worst of the
+# three: it costs the full 4.4x and does not guarantee the property it is paying for. A comparison that passes because a kernel quietly went nondeterministic has proved
+# nothing, so it must fail loudly instead.
+os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+STRICT_DETERMINISM = os.environ.get("PLEXUS_STRICT_DETERMINISM", "") not in ("", "0", "false")
+if STRICT_DETERMINISM:
+    torch.use_deterministic_algorithms(True, warn_only=False)
+
+from plexus.models.base import Hierarchy, Level
+from plexus.models.state import spatial_schema, schema_from_spec, StateSchema, BOUNDARY_WORLD
+from plexus.models.registry import _ENTITY_REGISTRY, get_operator, get_entity, get_field
+import plexus.operators        # noqa: F401  self-registers the operator library
+import plexus.models.entities  # noqa: F401  self-registers entity state-schemas
+from plexus.models.entities import DEFAULT_STATE_SCHEMA, DEFAULT_RENDER
+from plexus.schema import Spec, Selector
+from plexus.paths import warn
+
+# per-species display colours when the spec's plotting block names none (Lague's RGBA)
+_DEFAULT_FIELD_COLORS = [
+    (0.20, 0.95, 0.65), (1.00, 0.35, 0.45), (0.40, 0.65, 1.00), (1.00, 0.85, 0.30),
+]
+
+
+def _spawn(mode: str, n: int, box, radius: float, rng, device: str):
+    """Initial positions + headings for a self-propelled set (Lague's SpawnMode).
+
+    Placement is framed to the actual world box `[W, H]` -- the disc/point/ring are
+    centred at `(W/2, H/2)` and clamped to `[0,W] x [0,H]`. (A unit-height world H=1 is
+    byte-identical to the old hard-coded `cy=0.5` / `[0,1]` clamp.)
+
+    Heading is a [n, 2] unit VECTOR (the universal orientation representation, the
+    same [N, D] convention as `_spawn3d`), not a scalar angle -- so `glide`,
+    `bounce`, and `sense` are one dimension-generic operator each."""
+    box = box.float() if torch.is_tensor(box) else torch.as_tensor(box, dtype=torch.float32, device=device)
+    W = float(box[0]); Hh = float(box[1]) if box.numel() > 1 else 1.0
+    cx, cy = W / 2.0, Hh / 2.0
+    if mode == "random":
+        pos = torch.rand(n, 2, generator=rng, device=device); pos[:, 0] *= W; pos[:, 1] *= Hh
+        a = torch.rand(n, generator=rng, device=device) * 2 * math.pi
+    elif mode in ("point", "center"):
+        pos = torch.stack([torch.full((n,), cx, device=device), torch.full((n,), cy, device=device)], 1)
+        pos = pos + (torch.rand(n, 2, generator=rng, device=device) - 0.5) * 1e-3
+        a = torch.rand(n, generator=rng, device=device) * 2 * math.pi
+    elif mode == "disc":
+        r = torch.sqrt(torch.rand(n, generator=rng, device=device)) * radius
+        a = torch.rand(n, generator=rng, device=device) * 2 * math.pi
+        pos = torch.stack([cx + r * torch.cos(a), cy + r * torch.sin(a)], 1)
+        a = torch.rand(n, generator=rng, device=device) * 2 * math.pi
+    elif mode in ("sunflower", "disc_even", "equidistant"):     # Vogel golden-angle spiral: even disc coverage
+        idx = torch.arange(n, dtype=torch.float32, device=device) + 0.5
+        r = torch.sqrt(idx / n) * radius
+        theta = math.pi * (1.0 + 5.0 ** 0.5) * idx
+        pos = torch.stack([cx + r * torch.cos(theta), cy + r * torch.sin(theta)], 1)
+        a = torch.rand(n, generator=rng, device=device) * 2 * math.pi
+    elif mode in ("ring_in", "ring_out"):
+        a = torch.rand(n, generator=rng, device=device) * 2 * math.pi
+        pos = torch.stack([cx + radius * torch.cos(a), cy + radius * torch.sin(a)], 1)
+        a = (a + math.pi) if mode == "ring_in" else a
+    else:
+        raise ValueError(f"unknown spawn mode {mode!r}")
+    pos[:, 0] = pos[:, 0].clamp(0, W - 1e-6); pos[:, 1] = pos[:, 1].clamp(0, Hh - 1e-6)
+    head = torch.stack([torch.cos(a), torch.sin(a)], dim=1)        # [n, 2] unit heading
+    return pos, head
+
+
+def _spawn3d(mode: str, n: int, box, radius: float, rng, device: str, thickness: float = 0.0):
+    """Initial 3D positions + a unit-vector heading for a self-propelled set -- the
+    3D counterpart of `_spawn`. `ball`/`sphere`/`disc` seed a solid ball of `radius`
+    about the box centre; `disk` seeds a FLAT disc in the xy-plane (radius `radius`) with
+    out-of-plane Gaussian `thickness` along z (a thin rotating disc); `point`/`center` a
+    jittered centre; `random` fills the box. Heading is a random unit 3-vector."""
+    box = torch.as_tensor(box, dtype=torch.float32, device=device)
+    c = box * 0.5
+    if mode == "random":
+        pos = torch.rand(n, 3, generator=rng, device=device) * box
+    elif mode in ("point", "center"):
+        pos = c.expand(n, 3) + (torch.rand(n, 3, generator=rng, device=device) - 0.5) * 1e-3
+    elif mode in ("disc", "ball", "sphere"):
+        d = torch.randn(n, 3, generator=rng, device=device)
+        d = d / d.norm(dim=1, keepdim=True).clamp(min=1e-9)
+        r = torch.rand(n, generator=rng, device=device).pow(1.0 / 3.0) * radius   # uniform in the ball
+        pos = c.expand(n, 3) + d * r[:, None]
+    elif mode in ("disk", "flat_disc"):
+        r = torch.sqrt(torch.rand(n, generator=rng, device=device)) * radius       # uniform-area xy disc
+        th = torch.rand(n, generator=rng, device=device) * 2 * math.pi
+        pos = c.expand(n, 3).clone()
+        pos[:, 0] = c[0] + r * torch.cos(th)
+        pos[:, 1] = c[1] + r * torch.sin(th)
+        if thickness > 0:
+            pos[:, 2] = c[2] + thickness * torch.randn(n, generator=rng, device=device)
+    else:
+        raise ValueError(f"unknown 3D spawn mode {mode!r}")
+    pos = torch.minimum(pos.clamp(min=0.0), box - 1e-6)
+    head = torch.randn(n, 3, generator=rng, device=device)
+    head = head / head.norm(dim=1, keepdim=True).clamp(min=1e-9)
+    return pos, head
+
+
+def _spawn_pair3d(n: int, box, radius: float, rng, device: str, thickness: float = 0.0,
+                  separation: float = 0.0, offset: float = 0.0, tilt: float = 0.0,
+                  arms: dict | None = None):
+    """TWO flat discs, placed for an ENCOUNTER -- the `two_disks` 3D spawn mode.
+
+    Group 0 is centred at `(cx - separation/2, cy - offset/2, cz)` and group 1 at
+    `(cx + separation/2, cy + offset/2, cz)`, so `separation` is the initial distance BETWEEN
+    THE TWO DISC CENTRES along x and `offset` is the impact parameter along y (0 = head-on).
+    Group 1's plane is tilted by `tilt` RADIANS ABOUT THE X-AXIS, so the two discs are not
+    coplanar (an inclined encounter, after Toomre & Toomre 1972). Each disc is a uniform-area
+    xy disc of `radius` with out-of-plane Gaussian `thickness`, exactly as `spawn: disk`.
+
+    The pair is ONE set (not two), because that is what makes the two galaxies feel each other:
+    `squared_law all_pairs` sums over the whole set, so mutual gravity is the same operator that
+    holds each disc together. Returns (pos [n,3], head [n,3], group id [n] in {0,1},
+    rot [2,3,3]) -- `rot` is each group's plane rotation, which the velocity IC needs to put the
+    orbits in the disc's own plane rather than in xy.
+    """
+    # RADIUS AND THICKNESS MAY BE A PAIR. `spawn_radius: [3.6, 4.8]` gives the two galaxies
+    # DIFFERENT SIZES -- an unequal-mass-ratio encounter, which is the common case in nature and
+    # the interesting one to watch: at equal mass the two discs destroy each other symmetrically,
+    # while a compact companion punches through an extended primary and survives it. A scalar
+    # still means both, so every existing spec is unchanged.
+    def _pair(v, what):
+        if isinstance(v, (list, tuple)):
+            if len(v) != 2:
+                raise ValueError(f"spawn_{what}: give one value for both discs or two, got {len(v)}")
+            return [float(v[0]), float(v[1])]
+        return [float(v), float(v)]
+
+    radius = _pair(radius, "radius")
+    thickness = _pair(thickness, "thickness")
+    box = torch.as_tensor(box, dtype=torch.float32, device=device)
+    c = box * 0.5
+    ct, st = math.cos(tilt), math.sin(tilt)
+    rot = torch.tensor([[[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+                        [[1., 0., 0.], [0., ct, -st], [0., st, ct]]], device=device)
+    counts = (n // 2, n - n // 2)
+    centres = torch.stack([
+        c + torch.tensor([-0.5 * separation, -0.5 * offset, 0.0], device=device),
+        c + torch.tensor([+0.5 * separation, +0.5 * offset, 0.0], device=device)])
+    pos, gid = [], []
+    for g, k in enumerate(counts):
+        r = torch.sqrt(torch.rand(k, generator=rng, device=device)) * radius[g]  # uniform-area disc
+        th = torch.rand(k, generator=rng, device=device) * 2 * math.pi
+        # A SPIRAL THAT DOES NOT FADE WITH N. Left alone, the arms in a disc like this are seeded by
+        # SHOT NOISE and grown by swing amplification, so their amplitude starts at 1/sqrt(N): 0.63%
+        # at 25,000 particles and 0.10% at a million. The amplifier has a finite gain, so six times
+        # less seed is six times less arm -- which is why raising the particle count made the spiral
+        # DISAPPEAR rather than sharpen. It is the classic result (Sellwood & Carlberg 1984) and it
+        # is a property of the initial condition, not of the solver.
+        #
+        # `spawn_arms` plants the pattern instead of waiting for noise to. Displacing each star in
+        # azimuth by (A/m) sin(m*phi) crowds them towards m equally spaced ridges: dphi'/dphi =
+        # 1 + A cos(m*phi), so the surface density is modulated by A, whatever N is. Winding the
+        # phase with ln(r) makes those ridges a LOGARITHMIC SPIRAL of pitch angle `pitch` degrees --
+        # a real trailing two-armed pattern for the amplifier to work on, not a bar.
+        if arms and float(arms.get("amplitude", 0.0)) > 0.0:
+            A = float(arms["amplitude"])
+            mm = float(arms.get("m", 2))
+            pitch = math.radians(float(arms.get("pitch", 20.0)))
+            phase = th - torch.log(r.clamp(min=1e-6) / radius[g]) / math.tan(pitch)
+            th = th + (A / mm) * torch.sin(mm * phase)
+        z = (thickness[g] * torch.randn(k, generator=rng, device=device)
+             if thickness[g] > 0 else torch.zeros(k, device=device))
+        local = torch.stack([r * torch.cos(th), r * torch.sin(th), z], 1)
+        pos.append(local @ rot[g].T + centres[g])                             # tilt, then translate
+        gid.append(torch.full((k,), g, dtype=torch.long, device=device))
+    pos = torch.cat(pos); gid = torch.cat(gid)
+    head = torch.randn(n, 3, generator=rng, device=device)
+    head = head / head.norm(dim=1, keepdim=True).clamp(min=1e-9)
+    # NOT clamped into the box: `boundary: free` is unbounded and the pair must be free to
+    # merge and throw tails outside it. (`_spawn3d` clamps because a bounded run needs it.)
+    return pos, head, gid, rot
+
+
+def _orbit_groups(vinit, lvl, n, D, rng, device):
+    """`circular_orbit` for a set placed as GROUPS (`two_disks`): each group orbits ITS OWN
+    centre, in ITS OWN plane, and is then launched at the other one.
+
+    Per group: the enclosed mass M(<r) is summed over THAT GROUP only (the companion's mass is
+    not inside the disc), radius and tangent are measured in the group's plane (`spawn_group_rot`),
+    and `central_mass` parks that group's first particle at its centre as a core.
+
+    The encounter itself is two half-speeds added to every star of a disc: `approach` along the
+    separation axis (closing) and `swirl` perpendicular to it (orbiting). Together they fix the
+    pair's orbit exactly -- its energy from |v_rel| = 2 sqrt(approach^2 + swirl^2) against the
+    parabolic sqrt(2 G M_tot / d) (below it the pair is bound and returns to merge), and its
+    PERICENTRE from L = 2 x separation x swirl. The angular momentum has to come from `swirl`:
+    offsetting the two discs and aiming them at each other still gives L = 0, which is a plunge --
+    they fall through each other, merge on contact, and throw debris everywhere instead of tails.
+    `spins: [s0, s1]` overrides the shared `spin` per group, so one disc can turn retrograde.
+    """
+    G_const = float(vinit.get("G", 1.0)); spin = float(vinit.get("spin", 1.0))
+    soft = float(vinit.get("softening", 0.05)); jitter = float(vinit.get("jitter", 0.0))
+    cmass = float(vinit.get("central_mass", 0.0)); approach = float(vinit.get("approach", 0.0))
+    swirl = float(vinit.get("swirl", 0.0))
+    spins = list(vinit.get("spins", []) or [])
+    gid = lvl.spawn_group[:n]; rot = lvl.spawn_group_rot
+    ngroups = int(gid.max().item()) + 1
+    mbuf = getattr(lvl, "mass", None)
+    m = mbuf[:n].clone() if mbuf is not None else torch.ones(n, device=device)
+    st = lvl.state.clone(); px0, px1 = lvl.state_schema["pos"]
+    idxs = [torch.nonzero(gid == g, as_tuple=False).flatten() for g in range(ngroups)]
+    if cmass > 0.0:                                  # a core per group, parked at the group's centre
+        for g, idx in enumerate(idxs):
+            i0 = int(idx[0])
+            m[i0] = cmass
+            if mbuf is not None:
+                lvl.mass[i0] = cmass
+            st[i0, px0:px1] = st[idx, px0:px1].mean(0)
+        lvl.state = st
+    pos = lvl.get("pos")[:n]
+    centres = torch.stack([pos[idx].mean(0) for idx in idxs])
+    vel = torch.zeros(n, D, device=device)
+    for g, idx in enumerate(idxs):
+        R = pos[idx] - centres[g]
+        nrm = rot[g][:, 2]                            # the disc's normal (its own spin axis)
+        Rp = R - (R @ nrm)[:, None] * nrm[None, :]    # in-plane part: the orbital radius
+        rr = Rp.norm(dim=-1).clamp(min=1e-9)
+        order = torch.argsort(rr)
+        m_cum = torch.zeros(idx.numel(), device=device)
+        m_cum[order] = torch.cumsum(m[idx][order], 0)          # M(<r) inside THIS disc
+        v_circ = (spins[g] if g < len(spins) else spin) * \
+            torch.sqrt((G_const * m_cum.clamp(min=0)) / rr.clamp(min=soft))
+        tang = torch.linalg.cross(nrm.expand_as(Rp), Rp)       # CCW about the disc normal
+        tang = tang / tang.norm(dim=-1, keepdim=True).clamp(min=1e-9)
+        v = v_circ[:, None] * tang
+        bulk = torch.zeros(D, device=device)
+        side = torch.sign((centres[g] - centres.mean(0))[0])       # -1 = the low-x disc, +1 = high-x
+        if approach > 0.0:
+            # PARALLEL TO THE SEPARATION AXIS (x), not aimed at the companion: `approach` is the
+            # RADIAL (closing) half-speed and `swirl` below is the TANGENTIAL one.
+            bulk[0] = -side * approach
+        if swirl != 0.0:
+            # the tangential half-speed, perpendicular to the separation axis: this is what sets
+            # the pair's orbital angular momentum L = separation x v_rel = 2 x separation x swirl,
+            # and so its PERICENTRE. `swirl` positive puts L along +z, the same way the discs turn
+            # (spin > 0), i.e. a PROGRADE encounter -- the case that raises tails, since the stars
+            # on the near side of each disc are then dragged along by the companion instead of
+            # sweeping past it. `swirl: 0` is a head-on plunge: L = 0, pericentre 0, prompt merger.
+            bulk[1] = side * swirl
+        if approach > 0.0 or swirl != 0.0:
+            v = v + bulk[None, :]
+        if jitter > 0.0:
+            v = v + jitter * torch.randn(idx.numel(), D, generator=rng, device=device)
+        vel[idx] = v
+        if cmass > 0.0:                               # the core rides with the disc, without spin
+            vel[int(idx[0])] = bulk
+    return vel
+
+
+def _init_velocity(vinit, lvl, world_size, rng, device):
+    """Initial velocity for a top-level set from its `vel_init` spec (a DICT mode).
+
+    Initialization is a spec concern, not an operator: placement lives in `spawn`, and a
+    computed initial VELOCITY lives here -- a physics-aware IC that may read all positions
+    and masses. Modes:
+      rest            v = 0
+      random          v ~ U(-speed, speed) per axis (the dict form of the legacy scalar)
+      circular_orbit  near-circular orbital speed v = spin*sqrt(G*M(<r)/r) from the enclosed
+                      mass (+ an optional `central_mass` point mass at node 0), tangential in
+                      the xy-plane -- the config-driven replacement for the old `disk_ic` op
+      solid_body      rigid rotation omega x r in the xy-plane
+      radial          v = speed * r_hat (outward >0 / inward <0)
+    Returns [n, D] velocity (n = live count). Mass-dependent modes read `lvl.mass`, so this
+    runs AFTER `_assign_types`."""
+    n = int((lvl.occ > 0).sum().item())                # top-level: the first n slots are live
+    pos = lvl.get("pos")[:n]; D = pos.shape[-1]
+    mode = str(vinit.get("mode", "random"))
+    c = 0.5 * world_size[:D]
+    R = pos - c; r = R.norm(dim=-1, keepdim=True).clamp(min=1e-9); rr = r.squeeze(-1)
+    if mode == "rest":
+        return torch.zeros(n, D, device=device)
+    if mode == "random":
+        v = float(vinit.get("speed", 0.0))
+        return (torch.rand(n, D, generator=rng, device=device) - 0.5) * (2 * v)
+    if mode == "circular_orbit":
+        # a set placed as two discs (`spawn: two_disks`) orbits PER GROUP: each disc about its
+        # own centre, in its own plane, plus the encounter velocity. The grouping is read from
+        # the placement that made it -- no separation/tilt number is repeated here.
+        if getattr(lvl, "spawn_group", None) is not None:
+            return _orbit_groups(vinit, lvl, n, D, rng, device)
+        G = float(vinit.get("G", 1.0)); spin = float(vinit.get("spin", 1.0))
+        soft = float(vinit.get("softening", 0.05)); jitter = float(vinit.get("jitter", 0.0))
+        mbuf = getattr(lvl, "mass", None)
+        m = mbuf[:n].clone() if mbuf is not None else torch.ones(n, device=device)
+        cmass = float(vinit.get("central_mass", 0.0))  # optional central point mass at node 0, parked at centre
+        if cmass > 0.0:
+            m[0] = cmass
+            if mbuf is not None:
+                lvl.mass[0] = cmass
+            st = lvl.state.clone(); st[0, :D] = c; lvl.state = st
+            pos = lvl.get("pos")[:n]; R = pos - c
+            r = R.norm(dim=-1, keepdim=True).clamp(min=1e-9); rr = r.squeeze(-1)
+        order = torch.argsort(rr)                       # enclosed mass M(<r) per particle
+        m_cum = torch.zeros(n, device=device); m_cum[order] = torch.cumsum(m[order], 0)
+        v_circ = spin * torch.sqrt((G * m_cum.clamp(min=0)) / rr.clamp(min=soft))
+        tang = torch.zeros(n, D, device=device)         # CCW tangent in the xy-plane (axes 0,1)
+        tang[:, 0] = -R[:, 1] / rr; tang[:, 1] = R[:, 0] / rr
+        vel = v_circ[:, None] * tang
+        if jitter > 0.0:
+            vel = vel + jitter * torch.randn(n, D, generator=rng, device=device)
+        if cmass > 0.0:
+            vel[0] = 0.0
+        return vel
+    if mode == "solid_body":
+        omega = float(vinit.get("omega", 1.0))
+        tang = torch.zeros(n, D, device=device)
+        tang[:, 0] = -R[:, 1]; tang[:, 1] = R[:, 0]     # omega x r in the xy-plane
+        return omega * tang
+    if mode == "radial":
+        speed = float(vinit.get("speed", 1.0))          # outward >0 / inward <0
+        return speed * (R / r)
+    raise ValueError(f"unknown vel_init mode {mode!r}")
+
+
+def _field_colors(H: Hierarchy, sim: Spec, fld) -> np.ndarray:
+    """Per-channel RGB for a field. A field coupled to a set colours its channels by
+    the set's types (slime: one colour per species). An uncoupled / prescribed field
+    (e.g. a video) binds to no set and renders in white (grayscale). `plotting.colors`
+    (Style) overrides either."""
+    couples = getattr(fld, "couples_to", None)
+    lvl = H.levels[couples] if couples in H.levels else None
+    names = list(getattr(lvl, "type_names", []) or []) if lvl is not None else []
+    pcolors = (sim.plotting or {}).get("colors", {})
+    cols = []
+    for c in range(fld.C):
+        nm = names[c] if c < len(names) else None
+        default = _DEFAULT_FIELD_COLORS[c % len(_DEFAULT_FIELD_COLORS)] if names else (1.0, 1.0, 1.0)
+        cols.append(pcolors.get(nm, default))
+    return np.array([[float(x) for x in col[:3]] for col in cols], np.float32)
+
+
+def _entity_schema(decl, dim: int) -> StateSchema | None:
+    """An entity's declared `STATE_SCHEMA`, resolved for this run's `dim` -- or None when
+    the entity declares nothing the engine may honour.
+
+    Three forms, and only two of them are a schema (the contract is written out in
+    `models/entities.py`):
+
+        StateSchema           a fixed layout, dimension-independent.
+        dim -> StateSchema    a CALLABLE, resolved here with the run's dimension. Every
+                              spatial entity uses `spatial_schema`.
+        {block: (c0, c1)}     the LEGACY dict -> None. A hint, never a schema.
+
+    THE LEGACY DICT RETURNS None DELIBERATELY, and this is the load-bearing line of the
+    change. Those dicts are all written `{"pos": (0, 2), "vel": (2, 4)}` -- two hard-coded
+    dimensions, from before the `dim` contract -- and they were never read, so nothing ever
+    caught it. Honouring one now would size a 3D set's state at four columns instead of six
+    and truncate `pos`/`vel` to (x, y) with no error raised anywhere: `mpm_block`,
+    `basement_membrane_particle` and `integrin_particle` are all used by `dim: 3` specs.
+    So the dict keeps meaning exactly what it has always meant -- nothing to the engine --
+    and a spatial entity declares `spatial_schema` instead.
+    """
+    if decl is None:
+        return None
+    if isinstance(decl, StateSchema):
+        return decl
+    if callable(decl):
+        return decl(dim)
+    return None                                    # legacy {block: (c0, c1)} dict: a hint only
+
+
+def _entity_meta(sname: str, dim: int = 2, entity: str | None = None) -> tuple[StateSchema | None, dict, int]:
+    """(state_schema, render, depth) for a set name, from the entity registry. `schema` is
+    None when the name is unregistered or the entity declares no honourable schema -- the
+    caller then falls back to `spatial_schema(dim)`. `depth` is the hierarchy-depth integer
+    (was the overloaded `level`).
+
+    `entity` OVERRIDES THE LOOKUP BY NAME, and it exists because a set's NAME is what the set
+    IS while the entity is what PROVIDES its state. The two coincide while a model has one
+    cloud of material points, which can simply be called `mpm_particle`. They stop coinciding
+    the moment a cell is decomposed into fifteen organelles that each own their own points:
+    `mitochondrion_node` and `golgi_node` are different sets and the same KIND of thing, and
+    only four names are registered aliases of the MPM particle. Without this the fifteenth set
+    would build with the default pos/vel schema, no `provision` would run, and the first
+    `mpm_strain` would die on a missing `F` -- naming the symptom, not the cause."""
+    try:
+        ent = get_entity(entity or sname)
+        schema = _entity_schema(getattr(ent, "STATE_SCHEMA", None), dim)
+        render = getattr(ent, "RENDER", None) or DEFAULT_RENDER
+        depth = getattr(ent, "DEPTH", None)
+        depth = depth if depth is not None else 0
+    except KeyError:
+        schema, render, depth = None, DEFAULT_RENDER, 0
+    return schema, render, depth
+
+
+def _resolve_schema(s: dict, D: int, sname: str | None = None, spatial: bool = False) -> StateSchema:
+    """The set's StateSchema (the fifth primitive), in precedence order:
+
+        1. the set's own `state:` block          -- the spec always wins;
+        2. the ENTITY's declared schema           -- declared once in `models/entities.py`;
+        3. `spatial_schema(D)`                    -- the dimension-aware pos/vel default.
+
+    STEP 2 IS NEW AND IT IS WHY THIS FUNCTION TAKES A NAME. Until now the registry was never
+    consulted at all -- the body was steps 1 and 3 -- so every `state_schema=` in the entity
+    registry was dead code, and an entity could not declare its own layout however carefully
+    it wrote one. A `neuron` whose `pos` is fixed geometry and whose `voltage` is the
+    integrated coordinate cannot be expressed by step 3, and restating it in every yaml is
+    exactly what a registry is for.
+
+    Step 3 is unchanged and still catches every current set: the six entities that carried a
+    legacy 2D dict now declare `spatial_schema`, which returns precisely what step 3 would
+    have -- so no existing spec moves a byte (`promotion_identical.py --phase A`)."""
+    if "state" in s:
+        declared = schema_from_spec(s["state"])
+        # A DECLARED STATE EXTENDS A SPATIAL SET, IT DOES NOT AMPUTATE IT. `spatial` is True when a
+        # `seed_positions` places this set -- and that operator refuses any set without a `pos`
+        # block, so such a set is spatial by definition. Declaring `state: {chem: 2}` on it meant
+        # "these cells ALSO carry a morphogen", and it used to mean "these cells carry ONLY a
+        # morphogen": the declared block replaced the default wholesale, so a spec had to restate
+        # position and velocity by hand to keep them, and the demo ladder's cells quietly lost
+        # their velocity while the seed promised "positions, velocities". Now the spatial default
+        # leads and the declared blocks follow. A spec that DOES declare `pos` keeps full control --
+        # an overdamped set with a first-order `pos` and no rate, or a fixed `integration: none`
+        # geometry, means exactly what it says -- and no spec that runs today can change, because
+        # every one this applies to would have raised in `seed_positions`.
+        if spatial and "pos" not in declared:
+            return StateSchema(list(spatial_schema(D).blocks) + list(declared.blocks))
+        return declared
+    # STEP 1b: A SET THAT IS A RELATION CARRIES NO POSITION, AND MUST NOT BE GIVEN ONE.
+    #
+    # A set declaring `maps:` is a relation -- a half-edge is a pairing of two vertices with a face,
+    # not a thing that sits anywhere -- so the pos/vel fallback below is wrong for it in a way that
+    # is not merely wasteful. Falling through to `spatial_schema` gave `half_edge` a `pos` block,
+    # and pass 1 SEEDS positions across the domain for any set that has one: declaring the mesh's
+    # 32,768-slot half-edge set on `divide_growing_ball` created 102,400 real particles scattered
+    # through the world box, which then outnumbered the 25,584 vertices and so became
+    # `_biggest_particle_set`'s answer -- the movie drew that cloud, demoted the epithelium to an
+    # inset, and the per-frame render went 55 ms -> 106 ms. Nothing about the physics changed; the
+    # spec had simply acquired a hundred thousand particles nobody asked for.
+    #
+    # An empty schema is the honest layout: no columns, `has_pos` False, no seeding, no `__pos` in
+    # the trajectory, and therefore invisible to every consumer that finds sets by asking which
+    # ones carry positions. The relation's content is its `maps:`, which the topology operators own.
+    if s.get("maps"):
+        return StateSchema([])
+    if sname is not None:
+        ent_schema, _render, _depth = _entity_meta(sname, D, s.get("entity"))
+        if ent_schema is not None:
+            return ent_schema
+    return spatial_schema(D)
+
+
+def _edges_from_file(path: str):
+    """(pre, post, weights) from an `.npz` holding `edge_index` [2, E] and optional `weights` [E].
+
+    WHY A FILE AT ALL, given the inline `edges:` list was chosen for determinism. It still is:
+    an npz is just as frozen as a literal, and it is the SAME array the generator wrote. What
+    the literal cannot do is scale. A connectome over 1,000 neurons at 1% connectivity is
+    10,000 connections, and 10,000 two-element YAML sequences is a 20,000-line spec that no
+    one reads and git cannot diff. The rule this keeps is the one that matters -- the spec
+    records WHICH connectome, not a procedure for inventing one at load time.
+
+    ONE KEY, ONE PATH. `edges_file:` is resolved through `graphs_data_path` exactly as
+    `PrescribedField` resolves `source:`; there is no search order to reason about.
+    """
+    from plexus.paths import graphs_data_path
+    p = path if os.path.isabs(path) else graphs_data_path(path)
+    if not os.path.exists(p):
+        raise FileNotFoundError(f"edges_file {path!r} -> {p} does not exist")
+    z = np.load(p)
+    if "edge_index" not in z.files:
+        raise ValueError(f"edges_file {p} has no 'edge_index' array (has: {z.files})")
+    ei = np.asarray(z["edge_index"])
+    if ei.ndim != 2 or ei.shape[0] != 2:
+        raise ValueError(f"edges_file {p}: edge_index must be [2, E], got {ei.shape}")
+    w = np.asarray(z["weights"]).reshape(-1) if "weights" in z.files else None
+    if w is not None and w.shape[0] != ei.shape[1]:
+        raise ValueError(f"edges_file {p}: {w.shape[0]} weights for {ei.shape[1]} edges")
+    return ei[0], ei[1], w
+
+
+def _build_edge_set(H, sname: str, s: dict, device: str) -> None:
+    """Build an EDGE-SET: a set whose elements are connections, joined to endpoint sets
+    by `pre`/`post` incidence maps. The connections come from an inline
+    `edges: [[pre, post], ...]` list or, for anything connectome-sized, from
+    `edges_file: <path.npz>` (`edge_index` [2, E] + optional `weights` [E]). The edge-set is
+    contained in `parent` (e.g. the network) and carries its own `state:` schema (usually
+    non-spatial). All edges are owned by the parent's slot 0 (a single network)."""
+    if s.get("edges_file"):
+        pre_a, post_a, w_a = _edges_from_file(s["edges_file"])
+        E = int(pre_a.shape[0])
+        pre = torch.as_tensor(np.ascontiguousarray(pre_a), dtype=torch.long, device=device)
+        post = torch.as_tensor(np.ascontiguousarray(post_a), dtype=torch.long, device=device)
+        weights = None if w_a is None else np.ascontiguousarray(w_a, dtype=np.float32)
+    else:
+        edges = s["edges"]
+        E = len(edges)
+        pre = torch.tensor([int(e[0]) for e in edges], dtype=torch.long, device=device)
+        post = torch.tensor([int(e[1]) for e in edges], dtype=torch.long, device=device)
+        # optional per-edge weights -> the `w` block (a fixed synaptic parameter): a parallel
+        # `weights: [...]` list, or a 3rd element of each edge `[pre, post, w]`.
+        weights = s.get("weights")
+        if weights is None and all(len(e) >= 3 for e in edges):
+            weights = [e[2] for e in edges]
+    schema = _resolve_schema(s, H.dim, sname)
+    state = torch.zeros(E, schema.dim, device=device)
+    if weights is not None and "w" in schema:
+        w0, w1 = schema["w"]
+        state[:, w0:w1] = torch.as_tensor(
+            np.asarray(weights, dtype=np.float32), device=device).reshape(E, w1 - w0)
+    occ = torch.ones(E, device=device)
+    parent_idx = torch.zeros(E, dtype=torch.long, device=device)
+    _, render, depth = _entity_meta(sname, H.dim)
+    lvl = Level(sname, depth=depth, state=state, occ=occ, state_schema=schema,
+                parent=parent_idx, parent_name=s["parent"],
+                pre=pre, post=post, pre_name=s["pre"], post_name=s["post"], role=s.get("role"))
+    lvl.render = render
+    _assign_types(lvl, s, H, device)
+    H.add_level(lvl)
+
+
+# THE PER-CELL NAMES THAT MAY LIVE ON THE CELL SET. A name here is served from the set when the
+# spec declares it and stays a mesh column when it does not, so the migration is per spec and per
+# rung rather than a flag day.
+MESH_CELL_STATE = ("A0", "P0", "V0f", "alive", "age", "ndiv",
+                   "Vbirth", "divjit", "phase", "phase_t", "cyc_inhib", "cyc_vprev",
+                   "mg_scale", "A0_init", "P0_init", "V0f_init",
+                   "apop_flag", "inhib_frac", "elong")
+
+
+def _link_mesh_maps(H, sim) -> None:
+    """Resolve `mesh:` -> the half-edge set -> `maps.face` -> the cell set, once every set is built.
+
+    A SECOND PASS BECAUSE A MAP NEEDS BOTH ENDS. `_build_mesh` runs while the sets are still being
+    allocated, so the half-edge set it names may not exist yet; the resolution has to happen after
+    the last `add_level`. `schema.py` has already checked that the named set exists and declares all
+    three roles, so anything reached here is a build-order bug rather than a spec error.
+
+    WHAT THIS REPLACES. `cell_set:` -- a key that named the cell set on the VERTEX set, and was then
+    repeated on 35 operator lines across `config/tissue` because an operator had no other way to
+    learn it. Now the mesh names its half-edge set, that set declares `face: cell`, and the answer
+    is derived in one place. `Level.mesh_cell_set` survives as the resolved answer so the table's
+    consumers need not each walk the maps -- derived, not declared twice.
+    """
+    for sname, lvl in H.levels.items():
+        hs = getattr(lvl, "mesh_set", None)
+        if hs is None:
+            continue
+        he = H.levels[hs] if hs in H.levels else None
+        maps = dict(getattr(he, "maps", {}) or {}) if he is not None else {}
+        if not maps:
+            raise ValueError(
+                f"set {sname!r} declares `mesh: {hs}` but {hs!r} has no `maps:`. The half-edge set "
+                f"is what states the topology: `srce`/`trgt` into the vertex set, `face` into the "
+                f"cell set.")
+        # `face` IS OPTIONAL, AND ITS ABSENCE IS THE 1D CASE. A mesh set declaring only `srce` and
+        # `trgt` is a CURVE -- a filament, a chain, an axoneme -- rather than a closed surface, so
+        # there is no cell set to resolve and nothing to serve from one. `mesh_cell_set` stays None,
+        # which is what every consumer already sees before `_resolve_mesh_sets` has run, and `nF`
+        # stays at the 0 `_build_mesh` allocated. See schema.py for why this is a relaxation rather
+        # than a second mesh kind.
+        lvl.mesh_vertex_set = maps["srce"]
+        lvl.mesh_cell_set = maps.get("face")
+        if lvl.mesh_cell_set is not None:
+            # PER-CELL STATE THE CELL SET DECLARES IS SERVED FROM THERE, not stored on the mesh
+            # table. Only the names the spec actually declares are bound, so a spec that has not
+            # moved yet keeps its columns and runs exactly as before -- which is what lets the
+            # twelve arrays migrate one writer-group at a time instead of in one unbisectable commit.
+            cl = H.levels.get(maps["face"]) if hasattr(H.levels, "get") else (
+                H.levels[maps["face"]] if maps["face"] in H.levels else None)
+            m = getattr(lvl, "mesh", None)
+            if cl is not None and m is not None and hasattr(m, "bind_cell_state"):
+                bound = m.bind_cell_state(cl, MESH_CELL_STATE)
+                if bound:
+                    print(f"[build] {sname}: {len(bound)} per-cell block(s) served from "
+                          f"{maps['face']!r}: {', '.join(bound)}", flush=True)
+        if maps["srce"] != sname or maps["trgt"] != sname:
+            raise ValueError(
+                f"set {hs!r} is {sname!r}'s mesh, so its `srce`/`trgt` maps must land in {sname!r}, "
+                f"not in {maps['srce']!r}/{maps['trgt']!r}. A half-edge runs between two vertices "
+                f"OF THE MESH IT BELONGS TO.")
+
+
+def _build_mesh(lvl, s: dict, device: str) -> None:
+    """Allocate the set's half-edge table if it declares one (`mesh: half_edge`).
+
+    THE TABLE IS EMPTY AND THAT IS THE POINT. Nothing here knows what surface the run wants -- a
+    sphere, an imported segmentation, a plate -- and inventing one would be `build` doing a seed
+    operator's job (see `build`'s own docstring on that split). What `build` does is what it does
+    for every other set: ALLOCATE THE CONTAINER AND DECLARE ITS SHAPE, so that by the time any
+    operator runs, `H.level('vertex').mesh` exists, is the right type, and answers `n_faces == 0`
+    rather than `AttributeError`. `mesh_seed` then FILLS it.
+
+    Before this, a Level had no idea it carried a surface: `grep -rn "_mesh" src/plexus/` returned
+    nothing at all, while roughly forty consumers -- the mechanics, the T1s, the chemistry, the
+    recorder, the salvage, the D4 fingerprint, the renderers -- read an attribute one operator
+    happened to set. A spec could schedule `cell_mechanics` with no `mesh_seed` and get
+    `AttributeError: 'Level' object has no attribute '_mesh'` from inside an autograd pass.
+
+    `cell_set` IS RECORDED HERE because a face of the mesh IS a cell, and that pairing was declared
+    nowhere: `mesh_ops` takes it as an operator parameter twice and `edge_flip` falls back to the
+    literal string "cell". Declared once on the set, it can be defaulted from the level instead of
+    repeated on every operator that crosses between the two -- which is how `edge_flip` came to
+    renumber a set it never said it needed.
+    """
+    kind = s.get("mesh")
+    if kind is None:
+        return
+    from plexus.models.mesh import MeshTable
+    z = torch.empty(0, dtype=torch.long, device=device)
+    lvl.mesh = MeshTable(E_srce=z, E_trgt=z.clone(), E_face=z.clone(), nF=0, Nv=0)
+    # THE HALF-EDGE SET THIS MESH IS, BY NAME. `mesh:` names a declared set now, and that set's
+    # `maps:` are what say the topology: `srce`/`trgt` land in the vertex set, `face` in the cell
+    # set. `mesh_cell_set` is kept as the resolved answer to "which set are the faces" so that the
+    # forty consumers of the table need not each walk the maps, but it is now DERIVED from a
+    # declaration instead of being a second declaration -- `cell_set:` is gone from the schema.
+    lvl.mesh_set = kind
+    lvl.mesh_cell_set = None            # filled by `_link_mesh_maps` once every set exists
+
+
+def _entity_class(sname: str, entity: str | None = None):
+    """The registered entity class for a set name, or None. An entity MAY define a
+    `provision(lvl, parent, s, H, device)` classmethod to allocate domain-specific
+    per-node buffers at build time (e.g. mpm_particle's F/C/mass/mu/la/p_vol) -- the
+    contract-clean way to add new state without special-casing the engine."""
+    try:
+        return get_entity(entity or sname)
+    except KeyError:
+        return None
+
+
+def _measured_centers(sname, s, n, device):
+    """Body centres READ FROM THE SCAN instead of written down: `frame:` on a set, `place: measured`
+    on its types.
+
+    WHY A SPEC SHOULD NOT CARRY THE ARITHMETIC. The eye scene placed its two bodies by hand --
+    "the strap's centroid sits 0.6694 blend units from the globe's, along (-0.2193, 0.6321,
+    0.0225), and every length is that blend scaled by 0.17083" -- three numbers a person had to
+    compute, and six more for each further muscle. The shape folder already knows every part's
+    centroid, because the cutter measured it. `frame:` says how that folder's coordinates reach
+    this world, once:
+
+        frame: {shape: eye, origin: globe, at: [0.25, 0.25, 0.25], scale: {part: globe, radius: 0.08}}
+
+      shape   the library shape whose parts are being placed
+      origin  the part the frame is pinned to -- it lands exactly on `at`
+      at      where that part goes, in world units
+      scale   a number, or {part, radius}: the factor that makes THAT part's equivalent-sphere
+              radius equal `radius`, so a spec states a size it can measure in the picture rather
+              than a ratio it had to divide out
+
+    A type with `place: measured` is then placed at `at + scale * (its centroid - the origin's)`.
+    A type without one keeps whatever `start` gives it, so the two can be mixed.
+    """
+    import numpy as _np
+    import torch as _t
+    from plexus import shapes as _sh
+    fr = dict(s["frame"] or {})
+    shape = str(fr.get("shape") or "")
+    if not shape:
+        raise ValueError(f"sets.{sname}.frame: needs `shape: <a shape in the library>`")
+    folder, _ = _sh.resolve(shape)
+    alias = _sh.aliases(folder)
+    P = _sh.parts(shape)
+
+    def _part(nm):
+        nm = alias.get(str(nm), str(nm))
+        if nm not in P:
+            raise ValueError(f"sets.{sname}.frame: shape {shape!r} has no part {nm!r} "
+                             f"(it has {', '.join(sorted(P))})")
+        return P[nm]
+
+    o_name = fr.get("origin")
+    if o_name is None:
+        raise ValueError(f"sets.{sname}.frame: needs `origin: <the part the frame is pinned to>`")
+    o_cen = _part(o_name)[0].mean(0)
+    at = _np.asarray(fr.get("at", [0.0, 0.0, 0.0]), float)
+    sc = fr.get("scale", 1.0)
+    if isinstance(sc, dict):
+        V, F = _part(sc.get("part", o_name))
+        r_now = (3.0 * _sh._volume(V, F) / (4.0 * _np.pi)) ** (1.0 / 3.0)
+        sc = float(sc["radius"]) / max(r_now, 1e-30)
+    sc = float(sc)
+    rows = []
+    for tname, t in (s.get("types") or {}).items():
+        t = t or {}
+        cnt = int(t.get("count", 1))
+        shp = str(t.get("shape", "") or "")
+        if str(t.get("place", "")).lower() == "measured":
+            if not shp.startswith("mesh:"):
+                raise ValueError(f"sets.{sname}.{tname}: `place: measured` reads the part's own "
+                                 f"centroid, so the type must name one (`shape: mesh:{shape}/...`)")
+            c = at + sc * (_part(shp.split("/", 1)[-1] if "/" in shp else tname)[0].mean(0) - o_cen)
+        else:
+            c = at
+        rows += [c] * cnt
+    if len(rows) < n:
+        rows += [at] * (n - len(rows))
+    # THE SCAN ALSO SAYS HOW BIG EACH BODY IS. Under a measured frame the volume is not free: a
+    # part's own volume times scale^3 IS the body's, so six muscles of different sizes need six
+    # type lines and not six `particle_mass` numbers. `provision` reads this off the parent level.
+    vols = {}
+    for tname, t in (s.get("types") or {}).items():
+        t = t or {}
+        shp = str(t.get("shape", "") or "")
+        if str(t.get("place", "")).lower() == "measured" and shp.startswith("mesh:"):
+            V, F = _part(shp.split("/", 1)[-1] if "/" in shp else tname)
+            vols[tname] = float(_sh._volume(V, F)) * sc ** 3
+    print(f"[frame] {sname}: {shape} scaled by {sc:.5g}, {len(rows)} bodies placed from the scan "
+          f"about {o_name!r} at {_np.round(at, 4).tolist()}"
+          + (f"; volumes " + ", ".join(f"{k} {v:.4g}" for k, v in vols.items()) if vols else ""),
+          flush=True)
+    return _t.tensor(_np.asarray(rows[:n], _np.float32), device=device), {"scale": sc, "volume": vols}
+
+
+def _start_centers(start, n: int, rng, device: str) -> torch.Tensor:
+    """Explicit top-level placement from a spec `start`: either a list of D-point
+    coords (deterministic, tiled to n) or a flat region box [lo..., hi...] (2*D values,
+    uniform sample). Dimension-generic. Used by sets that seed at known locations
+    (e.g. an MPM water blob / falling cube)."""
+    if isinstance(start[0], (list, tuple)):
+        pts = torch.tensor([[float(x) for x in p] for p in start], device=device)
+        return pts[torch.arange(n, device=device) % pts.shape[0]]
+    v = [float(x) for x in start]; D = len(v) // 2
+    lo = torch.tensor(v[:D], device=device); hi = torch.tensor(v[D:2 * D], device=device)
+    return lo + torch.rand(n, D, generator=rng, device=device) * (hi - lo)
+
+
+def _resolve_emit(sim: Spec, H: "Hierarchy" = None) -> dict:
+    """set -> engine integration order (`velocity` or `acceleration`) of its COORDINATE
+    block, read from each force-emitting operator's `emit:` (spec, if given) else its class
+    `EMIT` -- one vocabulary, no translation table. Only the two engine-integrated states set
+    a set's order and must agree; `None` (emits no set delta) and `mpm_acceleration` (routed
+    to the MPM substep as a_ext, not the engine) do not participate. An operator whose
+    `INTEGRAND` names a NON-coordinate block integrates its OWN first-order block (chem/a0)
+    and so does not constrain the coordinate's order. A conflict is a modelling error."""
+    modes: dict[str, str] = {}
+    for o in sim.operators:
+        cls = get_operator(o.op, variant=o.impl)
+        # A SECOND SET AN OPERATOR INTEGRATES (exp17 batch 27, found 2026-10-12): an operator declared `at:` one set that
+        # also returns a delta for ANOTHER set's coordinate (state_diffuse[neuron_graph_alpha]: the neurons' dF/F and the
+        # lattice corners' angle) names that set here through `extra_emit_sets(params) -> {set: order}`. Without it the
+        # second set is in no operator's `at:`, so `_integrate` never visits it and its delta is wiped every tick: the
+        # corners' alpha sat at 0 through every batch-27 run, training and rollout alike.
+        extra = getattr(cls, "extra_emit_sets", None)
+        for s2, m2 in ((extra(o.params) or {}).items() if callable(extra) else ()):
+            if s2 in modes and modes[s2] != m2:
+                raise ValueError(f"set {s2!r} has operators with conflicting integration order ({modes[s2]} vs {m2} from {o.op!r})")
+            modes[s2] = m2
+        emit = o.params.get("emit") or getattr(cls, "EMIT", None)
+        if emit not in ("velocity", "acceleration"):
+            continue                                   # None / mpm_acceleration: no engine-integrated set delta
+        s = o.on.set
+        integrand = getattr(cls, "INTEGRAND", None)    # which block this op integrates (None = coordinate)
+        if integrand is not None and H is not None and s in H.levels:
+            coord = H.levels[s].state_schema.coordinate
+            if coord is not None and integrand != coord.name:
+                continue                               # a non-coordinate (first-order) integrand: doesn't set the order
+        if s in modes and modes[s] != emit:
+            raise ValueError(
+                f"set {s!r} has operators with conflicting integration order "
+                f"({modes[s]} vs {emit} from {o.op!r}); a set integrates as one order.")
+        modes[s] = emit
+    return modes
+
+
+# --------------------------------------------------------------------------- #
+#  build: spec -> Hierarchy
+# --------------------------------------------------------------------------- #
+def _default_reserve(s: dict, sname: str, per: int) -> int:
+    """Dormant slots per parent block: the spec's `grow_reserve`, else the entity's
+    `reserve_factor` times `per_parent`, else zero. One function for the allocation and for the
+    per-block type assignment, so the two cannot disagree about the block length."""
+    if "grow_reserve" in s:
+        return int(s["grow_reserve"])
+    _ecls = _ENTITY_REGISTRY.get(str(s.get("entity") or sname))
+    _rf = float(getattr(_ecls, "RESERVE_FACTOR", 0.0) or 0.0) if _ecls is not None else 0.0
+    return int(round(_rf * int(per)))
+
+
+def _assign_types(lvl: Level, s: dict, H: Hierarchy, device: str) -> None:
+    """Assign node_type by per-type fraction over the buffer, and build the per-type
+    parameter table the operator indexes (the inverse-problem target)."""
+    types = s.get("types")
+    if not types:
+        return
+    lvl.type_names = list(types.keys())
+    node_type = torch.zeros(lvl.n, dtype=torch.long, device=device)
+    # Type ordering over the buffer. Default: random permutation (salt-and-pepper mix).
+    # Opt-in `type_layout: split_x` sorts by x so the per-type fractions tile the domain
+    # left->right (type a = low x, last type = high x) -- seeds a spatial partition so a
+    # sorting force can be tested on whether it MAINTAINS/sharpens a split, decoupled from
+    # the symmetry-break-from-a-mixed-start problem. Positions are already set (build pass 1)
+    # before this runs, so state[:,0] is the live x-coordinate.
+    layout = s.get("type_layout", "random")
+    type_list = list(types.values())
+    if layout == "split_x":
+        # Split the LIVE cells by x (dead buffer slots stay type 0). MUST use the
+        # live count and live indices -- argsort over lvl.n (the buffer) sorts the
+        # dead slots (x=0) to the front, so they swallow the low-x types and ALL
+        # live cells fall into the last type (single-populated-type bug, cost b17).
+        perm = torch.nonzero(lvl.occ > 0, as_tuple=False).flatten()
+        perm = perm[torch.argsort(lvl.state[perm, 0])]
+        total = int(perm.numel())
+    elif layout == "split_y":
+        # Same as split_x but tiles the per-type fractions bottom->top (type a = low
+        # y, last type = high y). Lets a y-axis growth split be tested against the
+        # y-axis sediment/demix (ORG b102 growsplit_y). Same live-index guard as split_x.
+        perm = torch.nonzero(lvl.occ > 0, as_tuple=False).flatten()
+        perm = perm[torch.argsort(lvl.state[perm, 1])]
+        total = int(perm.numel())
+    elif layout == "ordered":
+        # THE i-TH TYPE GOES TO THE i-TH ELEMENT, in declared order, and the reserve stays type 0.
+        # For a set whose elements are individually placed (`start:` lists a centre per body) a
+        # random permutation decouples the material from the position: three balls with `count: 1`
+        # each put the liquid at whichever centre the generator drew. `ordered` is the layout a form
+        # or a hand-written list of bodies means -- "the first body is the red elastic one, at the
+        # first centre" -- and it is opt-in so every existing `fraction:` spec keeps its draw.
+        perm = torch.nonzero(lvl.occ > 0, as_tuple=False).flatten()
+        total = int(perm.numel())
+    else:
+        perm = torch.randperm(lvl.n, generator=H.rng, device=device)
+        total = lvl.n
+    # `count:` -- SAY HOW MANY, WHEN HOW MANY IS THE FACT YOU HAVE. A share is the natural
+    # statement for a mixture ("30% of the cells are motile") and the wrong one for an inventory:
+    # a cell atlas reports 421 plasma-membrane pieces and 77 mitochondria, and writing those as
+    # 0.100790 and 0.018433 of 4,177 hides the numbers, cannot be checked by eye, and lands on
+    # 421 only by rounding. The schema converts counts to fractions so every other reader is
+    # unchanged; the assignment below uses the count itself, so it is exact by construction and
+    # not by the arithmetic happening to round the right way.
+    counted = all("count" in t for t in type_list)
+    # A COUNT ON A CONTAINED SET IS PER PARENT, and it has to be, because that is what
+    # `per_parent` -- the number the schema makes it add up to -- already means. Assigned over the
+    # WHOLE level with one permutation, 25 cells sharing 27,600 compartments would each receive a
+    # MULTINOMIAL DRAW of each organelle rather than the atlas: one cell with 431 membrane patches
+    # and 129 nuclear ones, the next with 410 and 147, and nothing saying so. The inventory is a
+    # property of a cell, so it is tiled per cell and shuffled INSIDE each cell's block.
+    #
+    # The blocks are contiguous and in parent order (`repeat_interleave` in build's pass 2), so a
+    # parent's rows are `[b*per, (b+1)*per)`; the per-block shuffle is one argsort of a random
+    # matrix rather than a python loop over parents.
+    _per = s.get("per_parent")
+    if counted and "parent" in s and _per is not None and not isinstance(_per, dict):
+        # THE BLOCK IS `per_parent` PLUS THE RESERVE, and the reserve may come from the ENTITY
+        # (`reserve_factor`, see `build`) rather than from a `grow_reserve` line: an organelle set
+        # with counted species and no reserve line still allocates its dormant tail per parent, so
+        # dividing `lvl.n` by `per_parent` alone reported "do not divide into blocks".
+        per = int(_per) + _default_reserve(s, lvl.name, int(_per))
+        nblk = lvl.n // per
+        if nblk * per != lvl.n:
+            raise ValueError(f"{lvl.name}: {lvl.n} elements do not divide into blocks of {per}")
+        pat = torch.cat([torch.full((int(t["count"]),), tid, dtype=torch.long, device=device)
+                         for tid, t in enumerate(type_list)])
+        # THE SHUFFLE STAYS INSIDE THE LIVE HEAD OF THE BLOCK. The reserve tail (dormant, type 0
+        # until an operator wakes it) is appended AFTER the shuffle: shuffling the whole block
+        # mixed the tail's type-0 padding into the live rows, so a cell declared with one nucleus
+        # and thirty mitochondria would wake up with sixteen nuclei.
+        live_n = min(int(pat.numel()), per)
+        if layout == "ordered":
+            # THE DECLARED ORDER INSIDE EVERY BLOCK: type i's `count` rows first, then type i+1's.
+            # A Dale-signed circuit reads its sign vector off this layout, so it must be the one the
+            # spec wrote and not a draw.
+            head = pat[:live_n][None, :].expand(nblk, live_n)
+        else:
+            order = torch.argsort(torch.rand(nblk, live_n, generator=H.rng, device=device), dim=1)
+            head = pat[:live_n][order]                                    # [nblk, live_n]
+        tail = torch.zeros(nblk, per - live_n, dtype=torch.long, device=device)
+        node_type = torch.cat([head, tail], 1).reshape(-1)
+    else:
+        start = 0
+        for tid, t in enumerate(type_list):
+            if counted:
+                k = int(t["count"])
+            else:
+                # last type absorbs the remainder, so per-type rounding never leaves nodes unassigned
+                k = (total - start) if tid == len(type_list) - 1 else int(round(t["fraction"] * total))
+            node_type[perm[start:start + k]] = tid; start += k
+    lvl.register_buffer("node_type", node_type)
+    if all("p" in t for t in types.values()):
+        P = torch.tensor([list(t["p"]) for t in types.values()], dtype=torch.float32, device=device)
+        lvl.register_buffer("type_params", P)
+    # broadcast arbitrary per-type SCALAR props to per-agent buffers (slime's
+    # move_speed/turn_speed/sensor_*), exactly as Unity hands each agent its
+    # SpeciesSettings -- so operators read `lvl.move_speed` without indexing types.
+    scalar_keys = {k for t in types.values() for k, v in t.items()
+                   if k not in ("fraction", "p", "core", "layers", "color") and isinstance(v, (int, float))}
+    # KEEP THE PER-TYPE TABLE, not just the broadcast. Until now the type -> value mapping was
+    # consumed here and thrown away, so an operator that RE-TYPES a node later (mesh_seed splitting a
+    # spheroid at its equator) could rewrite `node_type` and leave every derived buffer holding the
+    # value of the type the node used to be. The table plus `retype` below make the derived buffers
+    # recoverable from the types at any point in a run, which is what makes re-typing legal at all.
+    lvl._type_scalars = {}
+    for k in sorted(scalar_keys):
+        tab = torch.tensor([float(t.get(k, 0.0)) for t in type_list], device=device)
+        lvl.register_buffer(k, tab[node_type.clamp(min=0, max=tab.numel() - 1)])
+        lvl._type_scalars[k] = tab
+    # THE RAW TABLE TOO, for the string properties (`region: basal`) an operator reads per type;
+    # `_type_scalars` keeps only what converts to a float.
+    lvl._type_table = [dict(t) for t in type_list]
+    lvl._type_fracs = torch.tensor([float(t.get("fraction", 1.0 / max(len(type_list), 1)))
+                                    for t in type_list], device=device)
+
+
+def retype(lvl, node_type) -> None:
+    """Rewrite a set's `node_type` and refresh every per-node buffer DERIVED from it.
+
+    The derived buffers (`_type_scalars`) are broadcast once at build; anything that changes a node's
+    type afterwards has to put them back or the node keeps its old type's properties while reporting
+    the new type -- a disagreement nothing would catch, because both halves look valid on their own.
+    """
+    lvl.node_type = node_type
+    for k, tab in (getattr(lvl, "_type_scalars", None) or {}).items():
+        getattr(lvl, k)[:] = tab[node_type.clamp(min=0, max=tab.numel() - 1)]
+
+
+
+# ==========================================================================================================
+# WHICH IMPLEMENTATION RUNS WHEN THE SPEC DOES NOT SAY
+# ==========================================================================================================
+MPM_WARP_DEFAULT = ("mpm_strain", "mpm_scatter", "mpm_grid_update", "mpm_gather")
+
+
+def _resolve_default_impl(sim, device: str, grad: bool = False) -> list[str]:
+    """Fill in `implementation: warp` for the MPM operators a spec left unspecified.
+
+    WHY THIS IS THE DEFAULT NOW, and it is a measured claim, not a preference. On si_waterfall
+    (570,760 particles, 96^3, 13 substeps) the whole-frame cost is 973.8 ms for the torch bodies,
+    38.7 ms with scatter/strain/gather on warp, and 31.8 ms with the grid solve on warp too -- the
+    last being fastest on BOTH cards and BOTH scenes of the sweep, by 1.22x on an A100 and 1.51x on
+    an A6000 over warp-without-the-grid-solve. Capture is already the engine's default
+    (`step.get("capture", True)`), so `warp` + capture is what a spec now gets for saying nothing.
+
+    IT FALLS BACK RATHER THAN FAILING, because `warp` is not a drop-in for every spec and a default
+    that raised would break 58 shipped 2D specs on the day it landed. Each condition below is a
+    thing the warp path genuinely cannot do:
+
+      dim != 3            the kernels are 3D; the 2D corpus stays on the torch bodies
+      device is cpu       warp kernels here are CUDA-only
+      periodic            the warp gather clamps at the box and does not wrap
+      grad=True           DIFFERENTIABLE = False -- no backward is registered with autograd, so an
+                          inverse run would silently get no gradient through the MPM cycle
+      legacy CSF          `mpm_grid_update[warp]` refuses surface_tension without csf_rho: that
+                          interface test is a reduction over the whole grid (54 specs)
+      csf_smooth, plate   not implemented in the fused kernel
+
+    WHAT IT COSTS THE CORPUS. `warp` is NOT bit-identical to the torch bodies -- reassociated 27-tap
+    sums and non-deterministic atomics, 6 ulp after 14 substeps -- so every 3D CUDA MPM spec that
+    named no implementation now produces slightly different numbers than it did. That is why the
+    resolution is written back onto the spec and printed: `implementation` is part of a run's
+    identity (section 6 of paper/mpm_warp.pdf), and a run must be able to say which one it used.
+    `implementation: default` forces the torch body back.
+    """
+    picked = []
+    # `implementation: default` IS AN ESCAPE HATCH, NOT A VARIANT NAME. Nothing is registered under
+    # that name, so it is normalised to None -- which is what selects the base torch body. The
+    # operators that asked are remembered, because the warp pass below keys on `impl is None` and
+    # would otherwise hand the hatch straight back to warp (it did, on the first attempt).
+    _forced = set()
+    for o in sim.operators:
+        if str(o.impl or "").lower() == "default":
+            o.impl = None
+            _forced.add(id(o))
+    _cuda = str(device).startswith("cuda")
+    _bad = grad or str(getattr(sim, "boundary", "wall")).lower() == "periodic"
+    # SQUARED_LAW IS RESOLVED BEFORE THE 3D GATE, because unlike the MPM kernels its warp variant is
+    # 2D AND 3D -- an all-pairs sum has no grid and no stencil, so nothing about it is dimensional.
+    #
+    # AND IT IS A BIGGER DEFAULT THAN THE MPM ONE. `_inv_square_sum` materialises the [N, N]
+    # separation matrices, ~12 N^2 bytes, so it is bound by writing down numbers it uses once: 9.35
+    # GB and 147.3 ms a step at 25,000 particles on an A6000, against 0.04 GB and 4.9 ms for the
+    # warp kernel -- 30x faster on 1/230th of the memory, and the memory is what decides whether a
+    # run is possible at all (120 GB of intermediates at 100,000 particles, 12 TB at a million).
+    # Only `all_pairs` is covered: the neighbour-graph branch is O(E) and materialises nothing, so
+    # there is nothing there to win.
+    if _cuda and not _bad:
+        for o in sim.operators:
+            if (o.op == "squared_law" and o.impl is None and id(o) not in _forced
+                    and bool(o.params.get("all_pairs", False))):
+                o.impl = "warp"
+                picked.append(o.op)
+    if int(getattr(sim, "dim", 2)) != 3 or not _cuda:
+        return picked
+    if _bad:
+        return picked
+    for o in sim.operators:
+        if o.op not in MPM_WARP_DEFAULT or o.impl is not None or id(o) in _forced:
+            continue
+        # `store_stress` IS ANOTHER THING THE WARP BODY GENUINELY CANNOT DO, so it belongs on this
+        # list beside cpu and periodic rather than in every spec that asks for it. The warp scatter
+        # accumulates momentum into the grid with atomics and never forms the per-particle Cauchy
+        # stress the default body caches to `sigma`. Picked silently, the loss surfaced two
+        # operators away -- `ecm_stress[measure: vonmises]` found no buffer and fell back to |J-1|,
+        # a different quantity drawn in the same colours, on a run whose subject is stress.
+        if o.op == "mpm_scatter" and bool(o.params.get("store_stress", False)):
+            continue
+        if o.op == "mpm_grid_update":
+            q = o.params
+            _st = float(q.get("surface_tension", 0.0) or 0.0)
+            if (_st > 0.0 and float(q.get("csf_rho", 0.0) or 0.0) <= 0.0
+                    or int(q.get("csf_smooth", 0) or 0)
+                    or q.get("plate_axis") is not None):
+                continue
+        o.impl = "warp"
+        picked.append(o.op)
+    return picked
+
+
+def build(sim: Spec, device: str = "cpu") -> Hierarchy:
+    """Construct the Hierarchy (levels + fields) from a validated `sim`, in three passes.
+
+    Pass 1 -- TOP-LEVEL sets (no parent): place each set's particles across the world box
+    (a `spawn` mode / explicit `start` / uniform fill), assign per-type properties, and set
+    the initial velocity (a scalar random kick, or a computed `vel_init` mode after types).
+    Pass 2 -- CONTAINED sets (children): map each to its parent index and scatter it inside,
+    then let the entity provision domain-specific per-node buffers (e.g. mpm_particle's F/C/mass).
+    Pass 3 -- continuous FIELDS: a pure-state grid bound to one set (one channel per coupled
+    type) whose dynamics live entirely in the deposit/diffuse/decay/sense operators.
+
+    THIS PASSES ALLOCATE-AND-PLACE, NOT "AND SEED". `spawn`/`start`/`vel_init`/`types` are
+    declarative DATA on `sets:`, read here rather than expressed as `seed:` operators, on
+    purpose (`_init_velocity`'s own note: initialization here is a SPEC concern, so a
+    physics-aware IC -- `vel_init: {mode: circular_orbit}` reading every mass and position --
+    is data the engine interprets, not procedural code a spec author writes). This is
+    DIFFERENT from a `seed:` operator (`seed()` below): both establish x_0 once, before any
+    dynamics, but `build`'s x_0 is declared per-set inline with the set, while a `seed:`
+    operator is a registered, reusable MECHANISM (mesh construction, segmentation import,
+    reaction-diffusion patterning) that several sets or specs can share. Use `sets:` keys for
+    a placement rule; reach for `seed:` when the initialization needs the same registry,
+    contract and reuse machinery as a dynamics operator, not a spec dialect of its own.
+    """
+    H = Hierarchy()
+    H.config = sim
+    H.rng = torch.Generator(device=device).manual_seed(sim.seed)
+    H.dim = int(getattr(sim, "dim", 2))                    # the dimension contract
+    H.world_size = torch.tensor([float(w) for w in getattr(sim, "world_size", [sim.world, 1.0])],
+                                device=device)             # per-axis box [w0 .. w_{D-1}]
+    H.world_width = float(H.world_size[0])                 # legacy scalar (axis-0 width)
+    H.boundary = sim.boundary                              # 'periodic' (wrap) | 'wall' (clamp) | 'free'/'none'/'open' (unbounded)
+    H.periodic = (sim.boundary == "periodic")
+    H.dt = float(sim.dt)                        # per-FRAME sim time; substeps read H.sub_dt
+    # THE FRAME NUMBER AS A DEVICE TENSOR, so a CAPTURED substep can depend on it.
+    # `H.frame` is a python int, and a CUDA graph bakes python constants in at capture: any
+    # operator whose behaviour varies with the frame -- a plate that closes, a ramped force, a
+    # scheduled stimulus -- would replay frame 1 forever, silently. Filled in place each tick
+    # OUTSIDE the graph, read as a tensor INSIDE it, so the value the kernels see is current.
+    H.frame_t = torch.zeros((), device=device)
+    H.obstacles = list(getattr(sim, "obstacles", []) or [])   # wall rects/discs for the `bounce` op
+    # WHAT ELSE IS IN THE SCHEDULE, so an operator can ask instead of guess.
+    #
+    # Needed because two operators can implement the same mechanism and only one of them should be
+    # active. `cell_grow`'s `vth_frac` ceiling is Okuda's uniform-cell mode -- it holds `v_eq` under
+    # `vth_frac * v_ref` so cells oscillate in a band WITHOUT a divider resetting them -- and once
+    # `cell_divide` is scheduled, division is what resets size. Left on, the ceiling is not size
+    # control, it is a lid BELOW the division threshold: on `divide_growing_ball` it caps the cell
+    # at 1.62x its reference while the trigger needs 2x, so growth stalls and the population sits at
+    # 200 for 401 frames.
+    #
+    # A NAME SET AND NOT A FLAG ON THE OPERATOR LINE, because the question is about the SCHEDULE and
+    # a spec should not have to say twice that it contains a divider. It is read-only and built once.
+    H.scheduled_ops = frozenset(o.op for o in (getattr(sim, "operators", None) or [])
+                                if getattr(o, "op", None))
+    # WHICH SETS A SEED PLACES IN SPACE -- see `_resolve_schema(spatial=)`. Read from the seed
+    # section (and the legacy seed-in-operators spelling), by the set each line acts `at:`.
+    _spatial = {o.on.set for o in list(getattr(sim, "seed_ops", None) or []) + list(sim.operators or [])
+                if getattr(o, "op", None) == "seed_positions"}
+
+    # pass 1: top-level sets (no parent) -- positions seeded across the domain.
+    for sname, s in sim.sets.items():
+        _frame_meta = None            # set by `frame:`; hung on the Level below
+        if "parent" in s:
+            continue
+        n = int(s["n"])
+        D = H.dim
+        buffer = int(s.get("buffer", n))               # allocated slots (occupancy marks live subset)
+        _, render, depth = _entity_meta(sname, D, s.get("entity"))   # render + depth from the registry
+        schema = _resolve_schema(s, D, sname, spatial=sname in _spatial)          # StateSchema: `state:` block, else the entity's, else pos/vel
+        dim = schema.dim
+        state = torch.zeros(buffer, dim, device=device)
+        has_pos = "pos" in schema                      # spatial sets place positions; a non-spatial set (voltage,...) does not
+        head = None
+        gid = None                                     # group id per particle (only the pair spawns)
+        grot = None
+        if has_pos:
+            px0, px1 = schema["pos"]
+            # WHERE A SET'S ENTITIES START IS A SEED OPERATOR, NOT A PROPERTY OF THE SET. `spawn:`
+            # and its `spawn_*` companions were read here, before any operator existed, so the one
+            # thing a seed is for -- writing x_0 -- happened outside the algebra with no operator
+            # responsible. `seed_positions` (operators/seed_ops.py) calls the same `_spawn` /
+            # `_spawn3d` / `_spawn_pair3d` below. A spec still carrying one of the old keys is
+            # refused rather than half-run, so nothing can migrate halfway.
+            _legacy = [k for k in s if k == "spawn" or str(k).startswith("spawn_")]
+            if _legacy:
+                raise ValueError(
+                    f"sets.{sname}: {', '.join(_legacy)} -- `spawn` is no longer a property of a "
+                    f"set. Where a set's entities start is a seed operator:\n"
+                    f"  seed:\n"
+                    f"    - {{op: seed_positions, at: {sname}, mode: {s.get('spawn', '...')!r}, "
+                    f"radius: {s.get('spawn_radius', '...')}}}\n"
+                    f"(`two_disks` takes separation / offset / tilt / thickness / arms; the set keeps "
+                    f"`n`, `state`, `types`, `vel_init`.)")
+            if s.get("frame") is not None and "start" not in s:
+                pos, _frame_meta = _measured_centers(sname, s, n, device)
+            elif "start" in s:
+                pos = _start_centers(s["start"], n, H.rng, device)  # known locations (e.g. an MPM blob)
+            else:
+                pos = torch.rand(n, D, generator=H.rng, device=device) * H.world_size   # uniform in the box
+            state[:n, px0:px1] = pos
+        vinit = s.get("vel_init", 0.0)                      # random initial speed (e.g. boids start moving)
+        if not isinstance(vinit, dict) and float(vinit or 0.0) > 0 and "vel" in schema:
+            vx0, vx1 = schema["vel"]
+            state[:n, vx0:vx1] = (torch.rand(n, D, generator=H.rng, device=device) - 0.5) * (2 * float(vinit))
+        occ = torch.zeros(buffer, device=device); occ[:n] = 1.0
+        # the runtime SET object: wraps the state tensor [buffer, 2D] (pos|vel columns per the
+        # schema) + the live-mask `occ` + the schema; operators read/write it via H.level(name).
+        lvl = Level(sname, depth=depth, state=state, occ=occ, state_schema=schema)
+        lvl.frame = _frame_meta                                 # None unless the set declared `frame:`
+        lvl.render = render
+        lvl.vmax = float(s["vmax"]) if "vmax" in s else None    # optional per-tick cell speed cap
+        lvl.maps = dict(s.get("maps") or {})    # declared functions OUT of this set (role -> set)
+        _build_mesh(lvl, s, device)                             # `mesh: <set>` -> an empty table to fill
+        if head is not None:
+            # heading is a unit VECTOR [., D] in every dimension (the universal
+            # orientation representation read by glide / bounce / sense).
+            hbuf = torch.zeros(buffer, head.shape[1], device=device)
+            hbuf[:n] = head
+            lvl.register_buffer("heading", hbuf)
+        if gid is not None:
+            # the placement records WHICH DISC each particle came from, and the plane it was
+            # placed in; `vel_init` reads both, so the orbit is set in the disc's own plane.
+            gbuf = torch.zeros(buffer, dtype=torch.long, device=device)
+            gbuf[:n] = gid
+            lvl.register_buffer("spawn_group", gbuf)
+            lvl.spawn_group_rot = grot
+        _assign_types(lvl, s, H, device)
+        lvl.types_raw = s.get("types")          # raw per-type config (layers/material/block) for child provisioning
+        # AN ENTITY MAY PROVISION A ROOT SET TOO, and until now only a CONTAINED one could. That
+        # asymmetry made a parent MANDATORY for anything whose buffers come from `provision` --
+        # `mpm_particle` gets F, C, mass, mu, la and p_vol there -- so a homogeneous slab of one
+        # material had to declare a container of ONE element that no operator ever touched, purely
+        # so the engine would take the branch that allocates the solver's state. Without it the run
+        # built cleanly and died at the first `mpm_strain` with `'Level' object has no attribute
+        # 'F'`, which names the symptom and not the cause.
+        #
+        # `parent=None` IS PASSED EXPLICITLY, so an entity that needs one says so itself rather
+        # than being handed a stand-in. The contained path below is unchanged.
+        _ent_r = _entity_class(sname, s.get("entity"))
+        _prov_r = getattr(_ent_r, "provision", None) if _ent_r is not None else None
+        if _prov_r is not None:
+            _prov_r(lvl, None, s, H, device)
+        # A COMPUTED VELOCITY IC READS x_0, AND x_0 IS FINAL ONLY AFTER THE SEEDS HAVE RUN. Applied
+        # here, `circular_orbit` measured radii and enclosed mass on the positions the build
+        # scattered uniformly, and `seed_positions` then moved every star into its disc -- so the
+        # orbits were set for a cloud that no longer existed. The IC is stashed and applied in
+        # `run()` right after `seed()`; for a set no seed moves, that is the same computation.
+        lvl._vel_init = vinit if (isinstance(vinit, dict) and "vel" in schema) else None
+        H.add_level(lvl)
+
+    # pass 2: contained sets -- the typed containment graph. Each child set is
+    # mapped to its parent (`parent` index + `parent_name`) and scattered within
+    # it; a parent may have MANY child sets of different roles (membrane,
+    # cytoplasm, nucleus, molecule), so a parent entity is a bundle of fibres.
+    for sname, s in sim.sets.items():
+        if "parent" not in s:
+            continue
+        pname = s["parent"]
+        if pname not in H.levels:
+            raise ValueError(f"set {sname!r} has parent {pname!r}, which is not a declared set")
+        parent = H.level(pname)
+        if s.get("edge_set"):                                     # an edge-set: elements are connections (pre/post), not scattered in space
+            _build_edge_set(H, sname, s, device)
+            continue
+        # `per_parent` MAY DEPEND ON WHAT KIND OF PARENT IT IS. As a single integer it says every
+        # parent holds the same number of children, which is right when the parents are copies of
+        # one body and wrong when they are not: a cell atlas gives a plasma-membrane patch 50
+        # material points and a nuclear-envelope patch 50,000, because a patch is thin and a
+        # nucleus is not, and forcing one number on both either under-samples the nucleus or spends
+        # 400,000 points on a membrane that needs 21,000. Written as a MAPPING from the parent's
+        # type name to a count, it stays one statement per compartment and the containment map
+        # absorbs the variation.
+        #
+        # The uniform path below is untouched -- `per` stays an int, `per_tot` stays an int, and
+        # every existing spec allocates exactly the tensor it did before.
+        per_map = s["per_parent"]
+        if isinstance(per_map, dict):
+            _tn = list(getattr(parent, "type_names", []) or [])
+            if not _tn:
+                raise ValueError(
+                    f"set {sname!r} gives `per_parent` as a mapping, but its parent {pname!r} "
+                    f"declares no `types:` -- there are no parent kinds to key it by.")
+            _missing = [t for t in _tn if t not in per_map]
+            _extra = [t for t in per_map if t not in _tn]
+            if _missing or _extra:
+                raise ValueError(
+                    f"set {sname!r} `per_parent` mapping does not match {pname!r}'s types: "
+                    f"missing {_missing or '-'}, unknown {_extra or '-'}. Every parent must be "
+                    f"told how many children it holds.")
+            if int(s.get("grow_reserve", 0)):
+                raise ValueError(
+                    f"set {sname!r} combines a `per_parent` mapping with `grow_reserve`. The "
+                    f"reserve is a fixed dormant tail on every parent's block, and with unequal "
+                    f"blocks there is no single tail length -- declare one or the other.")
+            per_vec = torch.tensor([int(per_map[_tn[int(t)]]) for t in parent.node_type.tolist()],
+                                   dtype=torch.long, device=device)
+            per = None                                       # no single count; `per_vec` is the answer
+        else:
+            per = int(per_map)
+            per_vec = None
+        radius = float(s.get("radius", 0.02))
+        # AN INNER RADIUS, SO A CHILD SET CAN BE A SHELL RATHER THAN A BALL. Without it every child
+        # is scattered through the WHOLE ball about its parent, so a cytosol and a nucleus declared
+        # on the same cell interpenetrate -- the nucleus occupies a volume the cytosol is also
+        # filling, which is not a cell but two clouds sharing a centre. `radius_inner` excludes the
+        # core, and the same key makes a MEMBRANE: a thin shell is just an annulus whose inner
+        # radius is close to its outer one. Zero (the default) is the old solid ball, so nothing
+        # archived moves.
+        r_in = float(s.get("radius_inner", 0.0))
+        # DORMANT SLOTS PER PARENT, for the operators that wake them. The default comes from the
+        # ENTITY (`reserve_factor`, a multiple of `per_parent`): a protein reservoir carries three
+        # dormant slots per seeded one without every spec writing a number for it; entities that
+        # declare no factor keep the old default of zero.
+        reserve = _default_reserve(s, sname, per) if per is not None else int(s.get("grow_reserve", 0))
+        per_tot = None if per is None else per + reserve
+        _, render, depth = _entity_meta(sname, H.dim, s.get("entity"))  # render + depth from the registry
+        schema = _resolve_schema(s, H.dim, sname, spatial=sname in _spatial)      # StateSchema: `state:` block, else the entity's, else pos/vel
+        dim = schema.dim
+        has_pos = "pos" in schema                                 # spatial child: scatter in space; non-spatial (voltage,...) child: no placement
+        if per_vec is None:
+            Np = parent.n * per_tot                               # `per` live + `reserve` dormant per parent slot
+            parent_idx = torch.arange(parent.n, device=device).repeat_interleave(per_tot)
+        else:
+            # THE BLOCKS ARE UNEQUAL BUT STILL CONTIGUOUS AND STILL IN PARENT ORDER, which is the
+            # property every reader of `lvl.parent` relies on -- `repeat_interleave` with a vector
+            # gives exactly that, so a child's rows are `[offset[p], offset[p] + per_vec[p])`.
+            Np = int(per_vec.sum())
+            parent_idx = torch.arange(parent.n, device=device).repeat_interleave(per_vec)
+            lvl_per_particle = per_vec[parent_idx]                 # this child's block size, per child
+            s = {**s, "_per_vec": per_vec, "_per_particle": lvl_per_particle}
+        state = torch.zeros(Np, dim, device=device)
+        D = H.dim                                                # the child's pos dimension (the global dim contract)
+        if has_pos:
+            px0, px1 = schema["pos"]
+            # A PARENT WITHOUT `pos` NAMES THE BLOCK ITS CHILDREN SCATTER ABOUT. A cell of a vertex
+            # tissue carries `centroid`, not `pos` (its position is the mesh's); `parent_pos: centroid`
+            # on the child set says so. Default `pos`, so nothing archived moves.
+            _pp = str(s.get("parent_pos", "pos"))
+            if _pp not in parent.state_schema:
+                raise ValueError(f"set {sname!r}: parent {pname!r} has no {_pp!r} block to scatter about; "
+                                 f"declare `parent_pos: <block>` on the child set")
+            ppos = parent.get(_pp)[parent_idx][:, :D]                # parent position, projected to the child's dim
+            # scatter each child uniformly in a ball of `radius` about its parent. The 2D
+            # polar path is kept verbatim (bit-identical MPM particle seeding); 3D+ uses a
+            # random unit direction so true 3D child sets are not collapsed onto a plane.
+            if D == 2:
+                # uniform in the ANNULUS: the area element is r dr, so sampling
+                # sqrt(u) between the two radii squared keeps the density flat rather than
+                # piling particles against the inner edge.
+                _u = torch.rand(Np, generator=H.rng, device=device)
+                r = torch.sqrt(r_in ** 2 + _u * (radius ** 2 - r_in ** 2)) if r_in > 0 \
+                    else torch.sqrt(_u) * radius
+                th = torch.rand(Np, generator=H.rng, device=device) * 2 * math.pi
+                offset = torch.stack([r * torch.cos(th), r * torch.sin(th)], 1)
+            else:
+                d = torch.randn(Np, D, generator=H.rng, device=device)        # isotropic direction
+                d = d / d.norm(dim=1, keepdim=True).clamp(min=1e-9)
+                # uniform in the D-ball, or in the D-annulus when an inner radius is set: the
+                # volume element is r^(D-1) dr, so the D-th root of a uniform draw between the two
+                # radii to the D-th power is flat in volume rather than bunched at the inside.
+                _u = torch.rand(Np, generator=H.rng, device=device)
+                r = (r_in ** D + _u * (radius ** D - r_in ** D)).pow(1.0 / D) if r_in > 0 \
+                    else _u.pow(1.0 / D) * radius
+                offset = d * r[:, None]
+            state[:, px0:px1] = ppos + offset
+            # `vel_init` on a CONTAINED set = one coherent random launch velocity per parent
+            # CELL (the ball/cube body), shared by all its particles, so the whole object
+            # translates (not per-particle jitter). `vel_init_cell` / `vel_init_cube`: aliases.
+            _vi = s.get("vel_init", s.get("vel_init_cell", s.get("vel_init_cube", 0.0)))
+            # A CONE OF LAUNCHES, not only a random box. `vel_init: {mode: cone, speed: 3, axis: 1,
+            # spread_deg: 30}` gives each parent a velocity of `speed` along `axis`, tilted by an
+            # angle drawn uniformly in [0, spread_deg] about a random azimuth -- a spray of jets
+            # leaving a surface, which the scalar form (a uniform box in every axis) cannot say.
+            # `speed_jitter` (a fraction of `speed`) varies the magnitude between parents.
+            _cone = isinstance(_vi, dict) and str(_vi.get("mode", "")).lower() == "cone"
+            vcell = 0.0 if isinstance(_vi, dict) else float(_vi)
+            if (_cone or vcell > 0) and "vel" in schema:
+                vx0, vx1 = schema["vel"]
+                vc = getattr(parent, "_launch_v", None)
+                if vc is None or vc.shape != (parent.n, D):
+                    if _cone:
+                        ax = int(_vi.get("axis", 1))
+                        sp = float(_vi.get("speed", 1.0))
+                        half = math.radians(float(_vi.get("spread_deg", 30.0)))
+                        jit = float(_vi.get("speed_jitter", 0.0))
+                        lat = [i for i in range(D) if i != ax]
+                        th = torch.rand(parent.n, generator=H.rng, device=device) * half
+                        vc = torch.zeros(parent.n, D, device=device)
+                        vc[:, ax] = torch.cos(th)
+                        if len(lat) == 1:                               # 2-D: one side or the other
+                            sgn = torch.where(torch.rand(parent.n, generator=H.rng, device=device) < 0.5, -1.0, 1.0)
+                            vc[:, lat[0]] = torch.sin(th) * sgn
+                        else:                                           # 3-D: a random azimuth
+                            phi = torch.rand(parent.n, generator=H.rng, device=device) * (2 * math.pi)
+                            vc[:, lat[0]] = torch.sin(th) * torch.cos(phi)
+                            vc[:, lat[1]] = torch.sin(th) * torch.sin(phi)
+                        mag = sp * (1.0 + jit * (torch.rand(parent.n, generator=H.rng, device=device) - 0.5) * 2.0)
+                        vc = vc * mag[:, None]
+                    else:
+                        vc = (torch.rand(parent.n, D, generator=H.rng, device=device) - 0.5) * (2 * vcell)
+                        _axes = s.get("vel_init_axes")
+                        if _axes is not None:
+                            keep = torch.zeros(D, device=device)
+                            for _a in _axes:
+                                keep[int(_a)] = 1.0
+                            vc = vc * keep
+                    # `types: [jet]` -- ONLY THOSE BODIES ARE LAUNCHED, the rest start at rest.
+                    # A pool and the jets leaving it are one set (they are one material); without
+                    # this the pool takes the launch too and the whole tank moves.
+                    # `per_type: {jet_a: {speed: 8.5, spread_deg: 12}, ...}` -- ONE CONE PER TYPE.
+                    # A spray whose jets differ in strength and opening is several launches, and a
+                    # single `speed` cannot say it; the types are the bodies' own declaration.
+                    _pt = (_vi.get("per_type") if isinstance(_vi, dict) else None) or {}
+                    if _pt and _cone:
+                        tn = list(getattr(parent, "type_names", []) or [])
+                        pnt = getattr(parent, "node_type", None)
+                        for t, kw in _pt.items():
+                            if t not in tn or pnt is None:
+                                continue
+                            sel = (pnt == tn.index(t))
+                            if not bool(sel.any()):
+                                continue
+                            sp_t = float(kw.get("speed", sp))
+                            half_t = math.radians(float(kw.get("spread_deg", float(_vi.get("spread_deg", 30.0)))))
+                            th_t = torch.rand(int(sel.sum()), generator=H.rng, device=device) * half_t
+                            d = torch.zeros(int(sel.sum()), D, device=device)
+                            d[:, ax] = torch.cos(th_t)
+                            if len(lat) == 1:
+                                sg = torch.where(torch.rand(int(sel.sum()), generator=H.rng, device=device) < 0.5, -1.0, 1.0)
+                                d[:, lat[0]] = torch.sin(th_t) * sg
+                            else:
+                                ph = torch.rand(int(sel.sum()), generator=H.rng, device=device) * (2 * math.pi)
+                                d[:, lat[0]] = torch.sin(th_t) * torch.cos(ph)
+                                d[:, lat[1]] = torch.sin(th_t) * torch.sin(ph)
+                            mg = sp_t * (1.0 + jit * (torch.rand(int(sel.sum()), generator=H.rng, device=device) - 0.5) * 2.0)
+                            vc[sel] = d * mg[:, None]
+                    _only = (_vi.get("types") if isinstance(_vi, dict) else None) or s.get("vel_init_types")
+                    if _only:
+                        tn = list(getattr(parent, "type_names", []) or [])
+                        want = torch.zeros(parent.n, dtype=torch.bool, device=device)
+                        pnt = getattr(parent, "node_type", None)
+                        for t in _only:
+                            if t in tn and pnt is not None:
+                                want |= (pnt == tn.index(t))
+                        vc = vc * want[:, None].to(vc.dtype)
+                    parent._launch_v = vc
+                state[:, vx0:vx1] = vc[parent_idx]
+        occ = parent.occ[parent_idx].clone()                      # a child is live iff its parent is
+        if reserve > 0:                                           # the `reserve` tail of each parent block starts DORMANT
+            block_pos = torch.arange(Np, device=device) % per_tot
+            is_reserve = block_pos >= per
+            occ[is_reserve] = 0.0
+            if has_pos:
+                state[is_reserve, px0:px1] = ppos[is_reserve]     # park the dormant pool at the parent centre
+        lvl = Level(sname, depth=depth, state=state, occ=occ, state_schema=schema,
+                    parent=parent_idx, parent_name=pname, role=s.get("role"))
+        lvl.render = render
+        lvl.maps = dict(s.get("maps") or {})
+        _build_mesh(lvl, s, device)                # a CONTAINED set may carry the surface too
+        _assign_types(lvl, s, H, device)
+        # A CONTAINED SET IS ALSO SOMEBODY'S PARENT, and until now only a ROOT set published its
+        # raw type table. `MPMParticle.provision` reads `parent.types_raw` for `youngs`,
+        # `material`, `density`, `layers` and `core`, so in a three-level chain -- cell ->
+        # compartment -> mpm_particle -- the middle set's types were invisible: MEASURED, a
+        # compartment set declaring `youngs: 400` (membrane) and `youngs: 80` (mitochondrion)
+        # produced mu = 41.67 for BOTH, the Lame pair of the 100.0 default, and no material mask
+        # was ever set. Two compartments meant to be two materials were one material wearing two
+        # colours, exactly as the two-level case was before the child's own `types` were honoured.
+        # Inert for every existing spec: the only three-level chains in the corpus are the neural
+        # ones (brain -> assembly -> neuron), and `Neuron` has no `provision` to read this.
+        lvl.types_raw = s.get("types")
+        # an entity may provision domain-specific per-node buffers (e.g. mpm_particle's
+        # F/C/mass/mu/la/p_vol + block-fill) -- read off the parent's per-type config.
+        ent = _entity_class(sname, s.get("entity"))
+        provision = getattr(ent, "provision", None) if ent is not None else None
+        if provision is not None:
+            provision(lvl, parent, s, H, device)
+        H.add_level(lvl)
+
+    # pass 2b: resolve every mesh's maps, now that every set exists.
+    _link_mesh_maps(H, sim)
+
+    # pass 3: continuous fields -- a field is a pure-state continuum bound to one
+    # set; the operators (deposit/diffuse/decay/sense) do all the dynamics. One
+    # channel per type of the coupled set unless `components` is given explicitly.
+    for fname, f in sim.fields.items():
+        cls = get_field(f.get("frame", "grid"))
+        couples = f.get("couples_to")
+        # passes couples_to/source/res/... by name; `title` is the field's plain-English name for a reader (the
+        # watcher's plexus pane), never a constructor argument
+        fcfg = {k: v for k, v in f.items() if k not in ("frame", "title")}
+        # a channel-per-type grid field defaults its components to the coupled set's
+        # type count; a prescribed field (e.g. `video`, carries `source`) defines its own.
+        if "components" not in fcfg and "source" not in fcfg:
+            ntypes = len(getattr(H.level(couples), "type_names", []) or []) if couples in H.levels else 0
+            fcfg["components"] = ntypes or 1
+        import inspect
+        if "dim" in inspect.signature(cls.__init__).parameters and "dim" not in fcfg:
+            fcfg["dim"] = H.dim                                       # N-D grid field follows the dimension contract
+        # THE PER-AXIS BOX, not just its width. `world_width` is world_size[0]; a field whose cell
+        # size must follow the world (MPMGrid) cannot derive it from one axis. Passed behind the
+        # same signature guard as `dim` above, so a field that does not accept it is untouched.
+        if "world_size" in inspect.signature(cls.__init__).parameters and "world_size" not in fcfg:
+            fcfg["world_size"] = [float(w) for w in H.world_size]
+        fld = cls(fname, width=H.world_width, device=device, **fcfg)   # name positional; rest by keyword
+        if hasattr(fld, "periodic"):
+            fld.periodic = H.periodic                                   # torus field iff the world wraps
+        H.add_field(fld)
+
+    return H
+
+
+# --------------------------------------------------------------------------- #
+#  seed: x_0 = S(theta_S), executed exactly once, before any dynamics
+# --------------------------------------------------------------------------- #
+def _capture_state(H, sets=None) -> list:
+    """Every tensor a substep can write. Snapshot/restore around a graph capture.
+
+    Warming up and capturing both run the substep body, so the state they leave behind is not the
+    state the run is supposed to continue from. Getting this wrong does not raise -- it silently
+    advances the simulation by however many warm-up substeps were used.
+    """
+    seen, out = set(), []
+    for _nm, lvl in H.levels.items():
+        if sets is not None and _nm not in sets:
+            continue                       # a set the captured block never touches cannot go stale
+        for _n, t in lvl.named_buffers(recurse=False):
+            if torch.is_tensor(t) and t.data_ptr() not in seen:
+                seen.add(t.data_ptr()); out.append(t)
+    for fld in H.fields.values():
+        for _n, t in fld.named_buffers(recurse=False):
+            if torch.is_tensor(t) and t.data_ptr() not in seen:
+                seen.add(t.data_ptr()); out.append(t)
+    return out
+
+
+def _block_sets(step: dict, inst: list) -> set:
+    """The sets the operators INSIDE one substep block act on -- and every set they reach through
+    containment, since an MPM scatter reads its ancestors' deltas.
+
+    Both capture checks were global: `_capture_refusals` refused whenever ANY set in the model was
+    engine-integrated, and `_graph_sig` compared EVERY buffer of every level. That is correct and
+    far too strong once a model does something outside the MPM cycle. Measured on the per-organelle
+    cell atlas: three `radius_graph` operators, scheduled once a frame OUTSIDE the substep, rebuild
+    `edge_index` on three sets the substep never touches -- and since `edge_index` is a registered
+    buffer, its new pointer changed the signature and the captured graph was dropped on tick 2 of
+    every run. Nothing was wrong; the check was simply looking at the wrong sets.
+    """
+    names = set()
+    toks = set(step.get("steps", []) or [])
+    for nm, ob, sel, _g in inst:
+        if nm in toks:
+            names.add(sel.set)
+            names.add(getattr(ob, "at", None))
+    names.discard(None)
+    return names
+
+
+def _graph_sig(H, sets=None) -> tuple:
+    """Identity of every buffer a captured graph baked in: storage address, shape, dtype.
+
+    A CUDA graph replays kernels against the pointers it saw at capture. Anything that reallocates
+    one of those tensors -- a structural operator resizing a set, `_integrate` rebinding
+    `lvl.state`, an operator assigning rather than copying -- leaves the replay writing into memory
+    the run no longer reads, and it does so SILENTLY: no error, just a simulation that quietly
+    stops advancing in whatever the stale buffer held. Cheaper and far more honest than trying to
+    predict from an operator's `kind` which of those things it might do: compare the addresses.
+
+    Once per tick over ~30 tensors, so the cost is nil against a 15-substep frame.
+    """
+    return tuple((t.data_ptr(), tuple(t.shape), t.dtype) for t in _capture_state(H, sets))
+
+
+def _capture_refusals(sim: Spec, H, step: dict, inst: list) -> list[str]:
+    """Why this substep block cannot be captured -- empty list means it can.
+
+    EVERY ITEM WAS MEASURED TO BREAK CAPTURE, not guessed. A refused capture costs a warning and
+    an eager run; an ACCEPTED capture that should have been refused costs a silently wrong result,
+    which is the failure this list exists to prevent.
+    """
+    why = []
+    if int(getattr(H, "dim", 2)) != 3:
+        why.append("dim != 3 (the 2D wall BC uses boolean-mask index_put and the 2D polar branch "
+                   "calls cuSOLVER; both are uncapturable and neither is rewritten yet)")
+    toks = set(step.get("steps", []))
+    for nm, ob, _sel, _g in inst:
+        if nm not in toks:
+            continue
+        if nm in ("mpm_scatter", "p2g") and str(getattr(ob, "polar", "svd")).lower() != "higham":
+            why.append(f"{nm} at {getattr(ob, 'at', '?')} uses polar={getattr(ob, 'polar', 'svd')!r}; "
+                       f"torch.linalg.svd is a cuSOLVER call and cannot be captured -- "
+                       f"set `polar: higham` on it")
+    # SNOW AND VISCOELASTIC ARE A PROPERTY OF THE IMPLEMENTATION, NOT OF THE MATERIAL. The default
+    # `mpm_strain` reaches those branches through `torch.linalg.svd` (cuSOLVER) and `F[sm] = ...`
+    # (boolean-mask indexing, hence `nonzero`, hence a sync) -- neither capturable. An
+    # implementation that does the same maths with `wp.svd3` and per-thread branches has neither,
+    # and says so with `CAPTURABLE_MATERIAL_BRANCHES`. Keyed on the material alone, this refused
+    # capture for every snow spec no matter who was computing the strain.
+    _strain_ok = any(getattr(ob, "CAPTURABLE_MATERIAL_BRANCHES", False)
+                     for nm, ob, _s, _g in inst if nm in toks and nm == "mpm_strain")
+    if not _strain_ok:
+        for name, lvl in H.levels.items():
+            for attr, label in (("is_snow", "snow"), ("is_visco", "viscoelastic")):
+                t = getattr(lvl, attr, None)
+                if t is not None and bool(t.any()):
+                    why.append(f"set {name!r} contains {label} particles; that branch of "
+                               f"mpm_strain is SVD plus boolean-mask indexing and is uncapturable "
+                               f"-- `implementation: warp` on mpm_strain removes this")
+    _touched = _block_sets(step, inst)
+    _ints = [n for n in (getattr(H, "emit_order", None) or {}) if n in _touched]
+    if _ints:
+        why.append(f"engine-integrated sets {_ints} -- `_integrate` rebinds lvl.state "
+                   f"every tick, so a captured graph would read a stale buffer")
+    # `mesh_contact` READS A SURFACE ON THE HOST EVERY FRAME. It rebuilds its direction-bin table
+    # from the live vertex set -- `torch.tensor` from a python list, `int(ef.max())`,
+    # `float(torch.quantile(...))` to size the grid, and `bool(near.any())` to skip an empty frame --
+    # so the block contains host->device copies and syncs by construction, not by accident.
+    # MEASURED: capture aborts at the first `torch.tensor(self.centre, ...)` with
+    # `cudaErrorStreamCaptureUnsupported`, then invalidates the whole capture. There is no version
+    # of this operator that captures while the surface can move, because the bin table is a
+    # different SHAPE from frame to frame -- a captured graph is a fixed list of kernels.
+    if {"mesh_contact"} & toks:
+        why.append("mesh_contact rebuilds its direction-bin table from the live surface every "
+                   "frame (host tensor construction, a quantile sync, a variable bucket depth), "
+                   "so the block is uncapturable while the surface moves")
+    # NO STATIC CHECK FOR "STRUCTURAL" OPERATORS. `kind` is the wrong proxy: what invalidates a
+    # graph is a buffer being REALLOCATED, and `kind="structural"` means "may change the entity
+    # set", which is neither necessary nor sufficient. `plate_confine` is tagged structural and
+    # only projects positions in place -- refusing it cost the squash experiment its capture for
+    # no reason -- while `_integrate` rebinds `lvl.state` and is not an operator at all. The
+    # property is checked directly instead, once per tick, by `_graph_sig` below.
+    return why
+
+
+def seed(H: Hierarchy, sim: Spec, device: str = "cpu") -> None:
+    """Run `sim.seed_ops` (the spec's `seed:` section) exactly once.
+
+    Not a loop, not a window, not gated by a frame number: there is no frame
+    number yet -- `H.frame` is set to 0 for the duration, since a seed operator
+    may legitimately read it (e.g. a prescribed field sampling its own t=0
+    slice), but nothing here iterates. Each seed operator runs ONE forward()
+    call, contract-identical to a dynamics operator's (`forward(H, mask) ->
+    {level: delta}`), so a seed CAN return a delta (e.g. an initial settle
+    nudge) -- accumulated and integrated once, same as a normal tick -- but the
+    common case (`MAY_MUTATE_INTEGRATED_STATE=True`, writes state directly,
+    returns `{}`) needs no integration step to take effect.
+
+    `sim.seed_ops` is empty for every spec written before the `seed:` section
+    existed; `seed()` is then a no-op, and `run()`'s legacy `_seed_window`
+    mechanism (unchanged) is what confines an old-style `kind="seed"` operator
+    still declared under `operators:`/`schedule:` to the opening frames.
+    """
+    if not sim.seed_ops:
+        return
+    H.frame = 0
+    H.zero_delta()
+    for o in sim.seed_ops:
+        cls = get_operator(o.op, variant=o.impl)
+        if getattr(cls, "KIND", None) != "seed":
+            # schema.py already rejects this at load time; re-checked here because
+            # `seed()` is a public entry point callable without going through load().
+            raise RuntimeError(
+                f"seed: {o.op!r} resolved to kind={getattr(cls, 'KIND', None)!r}, not "
+                f"\"seed\" -- refusing to run a dynamics operator as a seed.")
+        op = cls({**o.params, "to": o.to, "from": o.frm, "_at": o.on.set}, device)
+        H._active_op = o.op                          # see `Hierarchy.record_maps`
+        deltas = op(H, _selector_mask(H, o.on))
+        # THE SAME `(set, block)` KEY AS THE TICK LOOP, and it is here for the reason the two paths
+        # are ever allowed to differ: they are not. A seed that establishes a second dynamical block
+        # -- a monolayer's apico-basal separation seeded alongside its mid-surface positions -- would
+        # otherwise have its two deltas collapsed onto one `INTEGRAND` here while the tick loop
+        # routed them apart, so the same operator would mean two things depending on which entry
+        # point called it.
+        default_block = getattr(op, "INTEGRAND", None)
+        for key, d in deltas.items():
+            lvlname, blk = key if isinstance(key, tuple) else (key, default_block)
+            H.add_delta(lvlname, d, blk)
+    if any(torch.count_nonzero(d) for d in H._delta.values()):
+        _integrate(H, sim.dt)
+
+
+# --------------------------------------------------------------------------- #
+#  selectors: resolve to a live boolean mask, every tick
+# --------------------------------------------------------------------------- #
+def _coerce(s: str):
+    """Parse a selector value to int/float when numeric (so `done=0` compares to 0,
+    not the string '0'), else keep the string (for `type=a`)."""
+    for cast in (int, float):
+        try:
+            return cast(s)
+        except ValueError:
+            pass
+    return s
+
+
+def _selector_mask(H: Hierarchy, sel: Selector) -> torch.Tensor:
+    """The live boolean mask an operator acts on, from its `at:` selector. Recomputed
+    each tick, so occupancy and state-dependent selectors track the run:
+
+      at: <field>      -> None              (field-internal op: no per-node mask)
+      at: set          -> lvl.active        (all live nodes, occ > 0)
+      at: set[type=a]  -> live & node_type == a
+      at: set[attr=v]  -> live & lvl.attr == v   (any per-node buffer, e.g. cell[done=0])
+    """
+    if sel.set not in H.levels:                        # a field-internal operator (at: <field>)
+        return None                                    # has no per-node mask
+    lvl = H.level(sel.set)
+    if sel.attr is None:
+        return lvl.active                              # all live nodes
+    if sel.attr == "type":                             # type name -> node_type index
+        # A CONTAINED SET WEARS ITS PARENT'S TYPES. `mpm_particle` has no `types:` of its own --
+        # the bodies are typed on the cell -- so `at: mpm_particle[type=ramp]` died on a missing
+        # `node_type`, and the operator that was meant to hold the ramp never ran. A child's type
+        # is its parent's, which is what every other reader of these sets already assumes.
+        _nt, _names = getattr(lvl, "node_type", None), list(getattr(lvl, "type_names", []) or [])
+        if _nt is None or not _names:
+            _p = getattr(lvl, "parent_name", None)
+            _par = getattr(lvl, "parent", None)
+            while _p in H.levels and _par is not None:
+                _pl = H.level(_p)
+                if getattr(_pl, "node_type", None) is not None and (getattr(_pl, "type_names", []) or []):
+                    _nt, _names = _pl.node_type[_par], list(_pl.type_names)
+                    break
+                _par, _p = _pl.parent[_par] if getattr(_pl, "parent", None) is not None else None, getattr(_pl, "parent_name", None)
+        if _nt is None or sel.val not in _names:
+            raise ValueError(f"selector {sel.set!r}[type={sel.val!r}]: neither the set nor its parents "
+                             f"declare that type (they have {_names or 'none'})")
+        return lvl.active & (_nt == _names.index(sel.val))
+    # general set[attr=val]: match a per-node buffer (e.g. cell[done=0] -> lvl.done == 0)
+    if not hasattr(lvl, sel.attr):
+        raise ValueError(f"selector {sel.set!r}[{sel.attr}={sel.val}] has no per-node "
+                         f"buffer {sel.attr!r} on the set (set it via an operator first).")
+    return lvl.active & (getattr(lvl, sel.attr) == _coerce(sel.val))
+
+
+# --------------------------------------------------------------------------- #
+#  integration: accumulated delta -> next state, run ONCE per tick (implicit)
+# --------------------------------------------------------------------------- #
+def _integrate(H: Hierarchy, dt: float) -> None:
+    """Turn each set's accumulated delta into its next state, once per tick. The
+    integration order is resolved from the set's operators (H.emit_order):
+    `velocity` reads the delta as a velocity (x += dt·dpos); `acceleration` reads it as
+    an acceleration (v += dt·acc; x += dt·v). Only sets with engine-integrated operators
+    are integrated; others hold still (a set driven only by `mpm_acceleration` body
+    forces is advected by the MPM substep, not here). Friction is the `drag` operator,
+    not a knob here."""
+    box = H.world_size                                     # [D] per-axis box size
+    for name, emit in H.emit_order.items():
+        lvl = H.levels[name]
+        out = H.delta(name)
+        schema = lvl.state_schema
+        coord = schema.coordinate                          # the position-like integrated block (pos, or voltage, ...)
+        if coord is None:
+            continue                                       # no engine-integrated state
+        rate = schema.rate                                 # the rate block of a 2nd-order set (vel), or None (1st-order)
+        cx0, cx1 = schema.slice(coord.name)
+        x = lvl.state[..., cx0:cx1]
+        new = lvl.state.clone()
+        if rate is not None:
+            # inertial (2nd-order) set -- the pos/vel path, byte-identical to before:
+            #   EMIT=velocity     -> the rate block IS the delta (overdamped)
+            #   EMIT=acceleration -> integrate the delta into the rate block
+            vx0, vx1 = schema.slice(rate.name)
+            v = lvl.state[..., vx0:vx1]
+            v = out if emit == "velocity" else v + dt * out
+            vmax = getattr(lvl, "vmax", None)              # optional speed clamp (anti-overshoot)
+            if vmax:
+                sp = v.norm(dim=-1, keepdim=True)
+                v = v * (sp.clamp(max=vmax) / sp.clamp(min=1e-9))
+            x = x + dt * v
+            new[..., vx0:vx1] = v
+        else:
+            # first-order (overdamped) set -- the delta is dx/dt directly (voltage, gating, conc)
+            x = x + dt * out
+        if coord.boundary == BOUNDARY_WORLD:               # a spatial coordinate is clamped/wrapped to the box;
+            b = getattr(H, "boundary", "wall")             # a `free` block (voltage) has no box and is left alone
+            if b == "periodic":
+                x = torch.remainder(x, box)                # torus: wrap each axis by its size
+            elif b in ("free", "none", "open"):
+                pass                                       # unbounded: particles drift in open space
+            else:
+                x = torch.minimum(x.clamp(min=0.0), box)   # wall: clamp each axis to [0, w_k]
+        new[..., cx0:cx1] = x
+        lvl.state = new
+
+    # extra (non-coordinate) dynamical blocks: `pos` was integrated above; chem / a0 / ...
+    # are first-order integrands (x += dt*delta), unbounded (a free scalar/vector, not the
+    # world box). This is what lets ONE set carry several independently-integrated blocks --
+    # pos by the mechanics, chem by the RD, a0 by growth (plexus2 sec. Schedules).
+    for name, blocks in H._delta_blocks.items():
+        lvl = H.levels[name]; schema = lvl.state_schema
+        new = lvl.state.clone()
+        for bname, d in blocks.items():
+            cx0, cx1 = schema.slice(bname)
+            new[..., cx0:cx1] = new[..., cx0:cx1] + dt * d
+        lvl.state = new
+
+
+def _setup_recording(sim: Spec, H: Hierarchy):
+    """Allocate the DECIMATED trajectory buffers and announce the recording plan.
+
+    The trajectory is strided (sub-sampled), not stored every frame, to bound memory/disk on
+    long runs: SET frames (positions) keep <= `record_cap` (spec, default 10000); FIELD frames
+    -- each a full [C,nx,ny(,nz)] grid, so far larger -- keep <= `field_record_cap` (spec,
+    default 256). The stride is 1 (EVERY frame kept) when n_frames <= the cap, and the FINAL
+    frame is always recorded. Returns
+    (rec_index, rec_sets, occ_sets, rec_state, rec_mesh, fstride, rec_fields)."""
+    # `save_data` IS A YES/NO, and it is the one a spec should be writing. `record_cap` silently
+    # strided the trajectory -- a spec asking for 1800 frames got 301 and nothing said which -- and
+    # it is still honoured because 1,662 specs set it. When `save_data` is given it wins: True saves
+    # EVERY frame, False saves none. The size is printed either way, because 1800 frames of 2M
+    # particles is 40 GB and that should be a decision, not a discovery.
+    _sd = getattr(sim, "save_data", None)
+    if _sd is False:
+        set_cap = 1                                           # only the final frame, as a stub
+    elif _sd is True:
+        set_cap = sim.n_frames + 1                            # every frame, no striding
+    else:
+        set_cap = int(getattr(sim, "record_cap", 10000))      # legacy: max recorded SET frames
+    sstride = max(1, (sim.n_frames + set_cap) // set_cap)     # 1 if n_frames <= cap, else sub-sample
+    rec_ticks = sorted(set(range(0, sim.n_frames + 1, sstride)) | {sim.n_frames})   # ticks recorded (last always in)
+    rec_index = {t: i for i, t in enumerate(rec_ticks)}      # tick -> row index in the recording arrays
+    n_rec = len(rec_ticks)
+    # positions [n_rec, N, D] for spatial sets (those with a `pos` block); a non-spatial
+    # set (voltage, ...) records its state blocks in `rec_state` instead.
+    rec_sets = {name: np.zeros((n_rec, lvl.n, H.dim), np.float32)
+                for name, lvl in H.levels.items() if "pos" in lvl.state_schema}
+    occ_sets = {name: np.zeros((n_rec, lvl.n), bool) for name, lvl in H.levels.items()}               # live mask  [n_rec, N]
+    H._type_hist = {}                                                                                   # per-row node_type, typed sets only
+    # the state/ group: every recorded block that is NOT the spatial `pos` (empty for a
+    # pos/vel set, since `vel` is record=False) -> [n_rec, N, width]. This is how a neuron's
+    # voltage / calcium timeseries is stored without overloading pos.
+    rec_state: dict[str, dict] = {}
+    for name, lvl in H.levels.items():
+        blocks = [b for b in lvl.state_schema.recorded if b.name != "pos"]
+        if blocks:
+            rec_state[name] = {b.name: np.zeros((n_rec, lvl.n, b.width), np.float32) for b in blocks}
+    field_cap = int(getattr(sim, "field_record_cap", 256))   # fields are large grids -> a tighter, spec-tunable cap
+    fstride = max(1, (sim.n_frames + field_cap) // field_cap)
+    # THE TOPOLOGY, PER RECORDED ROW. A mesh set's `nF`/`Nv` and half-edge table change every time a
+    # cell divides or dies, so this cannot be a rectangular array -- it is a list, one snapshot per
+    # recorded row, exactly what `MeshTable.snapshot()` returns.
+    #
+    # WHY THE ENGINE AND NOT `topo_record`. That operator appends its history INSIDE the mesh table
+    # (`m.setdefault("hist", [])`), so the structure the engine now owns grows without bound for the
+    # length of the run, and every consumer of the table walks past a list of every frame it has
+    # ever had. Recording is the recorder's job. `topo_record` still runs and still writes `hist`;
+    # this is the dual write that lets it retire once the readers move over.
+    rec_mesh: dict[str, list] = {name: [] for name, lvl in H.levels.items()
+                                 if getattr(lvl, "mesh", None) is not None}
+    rec_fields: dict[str, list] = {fn: [] for fn in H.fields}
+    if not _QUIET:
+        print(f"[engine] {sim.n_frames} sim frames -> recording {n_rec} set frames (stride "
+              f"{sstride}), fields every {fstride} steps (<= {field_cap})", flush=True)
+    return rec_index, rec_sets, occ_sets, rec_state, rec_mesh, fstride, rec_fields
+
+
+# THE BANNER IS FOR A RUN, NOT FOR A ROLLOUT. `engine.run` prints the spec's header every call,
+# which is right when a call IS the run and useless when ten thousand of them are one training
+# job: the log becomes headers with the loss buried in it. `quiet(True)` silences the per-run
+# summary and the recording line and nothing else -- errors, warnings and operator output are
+# untouched, because a training loop that hides those is worse than a noisy one.
+_QUIET = False
+
+
+def quiet(on: bool = True) -> bool:
+    """Silence the per-run banner. Returns the previous value, so a caller can restore it."""
+    global _QUIET
+    was, _QUIET = _QUIET, bool(on)
+    return was
+
+
+def _print_run_summary(sim: Spec, H: Hierarchy) -> None:
+    """One-time neat banner: the world, the sets (with live counts), the fields, and the
+    operators (grouped by family) of this run -- so a glance shows what is being simulated."""
+    ws = "[" + ", ".join(f"{float(w):g}" for w in H.world_size.tolist()) + "]"
+    if _QUIET:
+        return
+    print(f"[engine] === {sim.name} ===  dim={H.dim}  world={ws}  boundary={sim.boundary}  "
+          f"dt={sim.dt:g}  frames={sim.n_frames}", flush=True)
+    # THE PHYSICAL SCALE, printed with the run rather than left to a reader's assumption. A run with
+    # no `general.units:` block says so out loud, because "dimensionless" is a property of the model
+    # and not an oversight to be discovered later from a number that looked like micrometres.
+    print(f"[build] {sim.units.describe()}", flush=True)
+    sets = "  ".join(f"{n}({int((l.occ > 0).sum().item())})" for n, l in H.levels.items())
+    print(f"[engine] sets:      {sets or '—'}", flush=True)
+    print(f"[engine] fields:    {'  '.join(H.fields) or '—'}", flush=True)
+    # operators grouped by their registry family (motion / interaction / mpm / ...), in spec order
+    by_fam: dict[str, list[str]] = {}
+    for o in sim.operators:
+        fam = getattr(get_operator(o.op), "FAMILY", "?")
+        by_fam.setdefault(fam, []).append(o.op)
+    groups = "   ".join(f"{fam}: {', '.join(ops)}" for fam, ops in by_fam.items())
+    print(f"[engine] operators: {groups}", flush=True)
+
+
+# --------------------------------------------------------------------------- #
+#  run: build -> iterate schedule -> record
+# --------------------------------------------------------------------------- #
+SEED_MAX = 10          # a seed runs on the opening frames; it can never span the run
+
+
+def _type_rows(hist, lvl):
+    """[n_rec, n] int16 of the type column per recorded row, or None when it never differed from the
+    final column (the common case: types are static, and a static column is already recorded once)."""
+    if not hist or getattr(lvl, "node_type", None) is None:
+        return None
+    final = lvl.node_type.detach().cpu().numpy().astype(np.int16)
+    if all(np.array_equal(v, final) for v in hist.values()):
+        return None
+    rows = max(hist) + 1
+    out = np.tile(final, (rows, 1))
+    for ri, v in hist.items():
+        out[ri] = v
+    return out
+
+
+def _seed_window(sim):
+    """LEGACY COMPATIBILITY ONLY -- the pre-`seed:`-section mechanism, kept so a `kind="seed"`
+    operator still declared under `operators:`/`schedule:` (deprecated; schema.py warns) keeps
+    working exactly as before. `seed()` (above) is the current mechanism: a spec using `seed:`
+    has `sim.seed_ops` populated, `seed()` runs those once before this window logic ever
+    matters, and schema.py's schedule validation refuses to let a `seed:`-declared operator
+    reach `run()`'s schedule at all. This function only ever sees the operators that DIDN'T
+    make that move yet.
+
+    How many opening frames a legacy `kind="seed"` operator runs for -- read from the spec in
+    one pass. The largest `before_frame` any such seed declares (1 if none does), capped at
+    SEED_MAX. A model may take a few frames to establish its state -- the working parents use
+    3, while a mesh relaxes -- but no model can ask an initial condition to run for the length
+    of the trajectory, which is what `cell_rd_seed mode: tip` did on all 900 frames.
+    """
+    declared = [int(o.params["before_frame"]) for o in sim.operators
+                if getattr(get_operator(o.op, variant=o.impl), "KIND", None) == "seed"
+                and "before_frame" in o.params]
+    return min(max(declared) if declared else 1, SEED_MAX)
+
+
+
+def _assemble(H, sim, rec_sets, occ_sets, rec_state, rec_fields, n_rows=None, rec_mesh=None):
+    """The recorded trajectory, from whatever the buffers hold.
+
+    Split out of `run` so a partial run can be salvaged: `on_frame` receives H every tick, and a
+    caller that stashes the buffers can call this after an interrupt and get the same structure
+    `run` would have returned, covering the frames actually reached.
+
+    `n_rows` TRUNCATES to the rows actually written. The recording arrays are PREALLOCATED to the
+    full frame count, so an interrupt at frame 12 of 40 leaves a (41, N, 3) array whose last 28
+    rows were never filled. Returning those would hand the analysis 28 frames of uninitialised
+    memory and every `_final` metric would be read off them -- silently, and worse than having no
+    trajectory at all. A salvaged run must be SHORT, not padded.
+    """
+    def _cut(a):
+        return a if (n_rows is None or a is None) else a[:max(1, int(n_rows))]
+
+    return {"sets": {name: {"pos": _cut(rec_sets.get(name)), "occ": _cut(occ_sets[name]),
+                           # non-spatial recorded blocks (voltage, calcium, ...); None for a pos/vel set
+                           "state": ({k: _cut(v) for k, v in rec_state[name].items()}
+                                     if rec_state.get(name) else None),
+                           # the recorded HALF-EDGE TABLE, one snapshot per row; None for a set
+                           # that declares no mesh. A LIST, not an array: nF and Nv change under
+                           # division and death, so the rows are ragged by construction.
+                           "mesh": ((rec_mesh or {}).get(name) or None
+                                    if n_rows is None else
+                                    ((rec_mesh or {}).get(name) or [None])[:max(1, int(n_rows))]),
+                           "node_type": (H.level(name).node_type.cpu().numpy()
+                                         if hasattr(H.level(name), "node_type") else None),
+                           "type_names": getattr(H.level(name), "type_names", None),
+                           # the per-row type column, only if some row differs from the final one
+                           "node_type_t": _type_rows(getattr(H, "_type_hist", {}).get(name), H.level(name)),
+                           # containment: which parent set + the per-node parent index, so a
+                           # plotter can render a container set as its merged child cloud.
+                           "parent_name": getattr(H.level(name), "parent_name", None),
+                           "parent": (H.level(name).parent.cpu().numpy()
+                                      if H.level(name).parent.numel() else None)}
+                    for name in H.levels},
+           "fields": {fn: {"grid": np.stack(fr[:n_rows] if n_rows else fr), "colors": _field_colors(H, sim, H.fields[fn]),
+                           "world": H.world_width}
+                      for fn, fr in rec_fields.items() if fr},
+           "world": H.world_width,
+           "world_size": H.world_size.cpu().numpy(),   # per-axis box [w0..w_{D-1}] (3D plotter reads it)
+           "name": sim.name}
+
+
+def _rec0(t: torch.Tensor) -> torch.Tensor:
+    """Trial 0 of a batched block `[B, N, W]`; an unbatched `[N, W]` unchanged.
+
+    THE RECORDED TRAJECTORY IS ONE TRIAL AND NOT ALL B, on purpose. The trajectory exists to be
+    rendered and diffed -- one movie, one twin comparison -- and every consumer of it (the
+    renderers, `test_plot`, the regression fingerprints) reads `[T, N, dim]`. Keeping all B would
+    multiply a long run's npz by the trial count for frames no renderer draws, and would break
+    that shape for every existing reader. A batch is a TRAINING device: the thing worth keeping
+    from it is the loss, which reaches the caller through `H`, not through the record.
+    """
+    return t[0] if t.dim() == 3 else t
+
+
+def expand_batch(H, B: int) -> int:
+    """Give every set a leading batch axis: [N, W] -> [B, N, W]. Returns B.
+
+    THE AXIS IS CREATED AFTER BUILD AND SEED, DELIBERATELY. Every seeding path -- placing somata
+    from a region, scattering a lattice, drawing types -- writes `state[:, a:b]` on a 2-D tensor,
+    and there are dozens of them. Expanding afterwards means not one of them changes: a trial is
+    seeded once and then copied, which is also the correct semantics (B trials of ONE world start
+    identically and diverge only through their inputs).
+
+    `repeat`, NOT `expand`: an expanded tensor shares storage across the batch, so the first
+    operator writing a block in place would write it into all B trials at once and every trial
+    would be the same run. The copy is the point.
+
+    A BATCH IS A NUMERICAL FACT AND NOT A BIOLOGICAL ONE. 32 trials are 32 runs of one world, not
+    32 worlds coexisting -- so this appears nowhere in the spec language, `Aggregate` never sees
+    it, and `H.dim` is unchanged. The alternative, trials as contained entities, would have made
+    the hierarchy assert something false.
+    """
+    if B <= 1:
+        return 1
+    for lvl in H.levels.values():
+        lvl.state = lvl.state.unsqueeze(0).repeat(B, *([1] * (lvl.state.dim())))
+    H.batch = int(B)
+    H.zero_delta()
+    return int(B)
+
+
+def apply_learnable_blocks(H, sim) -> list:
+    """`learnable: {block: w, of: recurrent}` -> an nn.Parameter the loss can reach.
+
+    A Level keeps ONE state tensor and a schema of column ranges, so "this block is fitted" cannot
+    be expressed by making the tensor a parameter -- that would fit every block at once, including
+    the ones that are measurements. Instead the block's current columns are lifted out into a
+    parameter held on the Level, and written back in each time the run starts. The write is
+    functional (clone, assign, publish), so the tape connects the parameter to every use of the
+    state downstream and a loss on the final frame differentiates back to it.
+
+    THE INITIAL VALUE IS WHATEVER THE SPEC PUT THERE, and that matters as much as the mechanism.
+    A connectome's `w` comes from an npz of measured synapse areas, so a fit STARTS at the
+    measurement and what training does is move away from it -- which is the readable quantity, the
+    one `plot_recovery_panels` puts on an axis. Initialising at random would discard the only
+    thing that makes the result interpretable.
+
+    Returns the parameters it created, in spec order.
+    """
+    made = []
+    held = getattr(sim, "fitted", None)
+    if held is None:
+        held = sim.fitted = {}
+    for e in getattr(sim, "learnable", []):
+        if "block" not in e:
+            # REFUSED, NOT SKIPPED. This line used to `continue` with the comment "an operator
+            # substitution; handled at instantiation", and nothing handled it: the run went ahead
+            # with the original operator and said nothing. `schema._parse_learnable` refuses the
+            # same entry; this catches a caller that sets `sim.learnable` without going through it.
+            raise ValueError(
+                f"learnable: {e} has no `block:`. Only {{block:, of:}} is fitted; a law "
+                f"substitution ({{replaces:, with:}}) is not implemented.")
+        lvl = H.level(e["of"])
+        blk = e["block"]
+        if blk not in lvl.state_schema:
+            raise ValueError(
+                f"learnable: block {blk!r} is not a block of set {e['of']!r} "
+                f"(it has {sorted(lvl.state_schema)}).")
+        a, b = lvl.state_schema[blk]
+        # THE PARAMETER IS HELD ON THE SPEC, NOT REMADE PER RUN, and that is what makes training
+        # possible at all. `engine.run` rebuilds the Hierarchy every call -- which is what makes a
+        # run reproducible -- so a parameter created inside one rollout does not survive into the
+        # next. An optimiser given the first rollout's tensors would then be moving objects no
+        # later rollout reads, the loss would wander, and nothing would say why. Holding it on the
+        # Spec means every rollout of one training run writes the SAME leaf into state.
+        key = f"{e['of']}.{blk}"
+        par = held.get(key)
+        if par is None:
+            par = held[key] = nn.Parameter(lvl.state[:, a:b].detach().clone())
+        if not hasattr(lvl, "_fitted"):
+            lvl._fitted = nn.ParameterDict()
+        lvl._fitted[blk] = par
+        st = lvl.state.clone()
+        st[:, a:b] = par
+        lvl.state = st
+        made.append(par)
+        if getattr(sim, "_learnable_announced", False) is False:
+            print(f"[learnable] {e['of']}.{blk}: {par.numel()} value(s) fitted, "
+                  f"starting at the spec's own", flush=True)
+    sim._learnable_announced = True        # once per spec, not once per rollout
+    return made
+
+
+def run(sim: Spec, out_path: str | None = None, device: str = "cpu",
+        on_frame=None, progress: bool = False,
+        grad: bool = False, batch: int = 1, on_seeded=None,
+        on_ready=None) -> tuple[Hierarchy, dict]:
+    """Forward-simulate `sim`. Returns (Hierarchy, recorded trajectory).
+
+    `on_ready(H)` is called ONCE, after every operator is instantiated (`H.operators`,
+    `H.operator_names`) and before the first tick: the moment a caller may set an operator's own
+    parameters, which do not exist yet at `on_seeded`. `plexus.trainer` uses it for learnables that
+    are parameters of an activity rather than state of a set.
+
+    `on_seeded(H)` is called ONCE, after the set-up is seeded and before the batch axis exists and
+    the first tick runs: the one moment a caller may write the starting state. `on_frame` cannot
+    stand in for it, because it fires at the END of each tick, after that tick's step -- a value
+    written there reaches the dynamics one step late. The engine attaches no meaning to what the
+    caller writes; `plexus.trainer` uses it to put its learnables into the state.
+
+    `grad=True` keeps the autograd tape across the whole rollout, so a loss on the FINAL state
+    differentiates back to the initial state and to any operator parameter stored as a tensor.
+    It is opt-in because the tape costs memory that forward generation has no use for, and
+    generation is what this function is called for 99% of the time.
+
+    The alternative -- which `prototype/inverse_slime/` had to accept and the jax-morph atlas
+    measured the cost of -- is a SECOND differentiable implementation of the same physics, kept in
+    step with this one by hand. One physics, one tape, is worth the argument.
+
+    Two things an inverse caller should know. The recorded trajectory is always detached: it is a
+    side-channel for plotting and scoring, never a path for the gradient, which lives in the
+    returned `H`. And a structural operator must apply its writes FUNCTIONALLY (clone, write,
+    publish) or it severs the tape for everything downstream of it -- see `agent_divide`.
+    """
+    _picked = _resolve_default_impl(sim, device, grad)
+    if _picked:
+        print(f"[engine] implementation: warp for {', '.join(_picked)} "
+              f"(unset in the spec; `implementation: default` forces the torch body)", flush=True)
+    H = build(sim, device)                    # 1) build the Hierarchy: every set (level) + field, from the spec
+    seed(H, sim, device)                      # 1.5) x_0 = S(theta_S): the seed: section, exactly once
+    for lvl in H.levels.values():             # 1.6) v_0 from x_0 -- see the stash in `build`
+        vinit = getattr(lvl, "_vel_init", None)
+        if vinit:
+            vx0, vx1 = lvl.state_schema["vel"]
+            vel = _init_velocity(vinit, lvl, H.world_size, H.rng, device)
+            st = lvl.state.clone(); st[:vel.shape[0], vx0:vx1] = vel; lvl.state = st
+            lvl._vel_init = None
+    apply_learnable_blocks(H, sim)            # 1.7) `learnable: {block:, of:}` -> tensor leaves
+    if on_seeded is not None:                 # 1.75) the caller's write into x_0 (see the docstring)
+        on_seeded(H)
+    expand_batch(H, int(batch))               # 1.8) [N, W] -> [B, N, W], after every seeding path
+    H.emit_order = _resolve_emit(sim, H)      # 2) per-set integration order (velocity=1st-order / acceleration=2nd), from the ops' EMIT
+    # 3) instantiate each operator ONCE -> (op_name, live instance, selector, frame-window); its params
+    #    carry the field refs (to/from) + the set name (_at), and the frame gate (after_frame/before_frame)
+    #    is enforced HERE by the engine, so no operator special-cases the clock.
+    # A `seed` IS GATED BY THE ENGINE, NOT BY THE SPEC -- running only at the start is what the
+    # kind means, so it is the engine's to enforce rather than each spec's to remember.
+    # `cell_rd_seed mode: tip` re-stamped its activation cap on all 900 frames and was a perfectly
+    # legal spec, because the discipline lived in a yaml key three parents carried and the whole
+    # campaign lineage did not.
+    seed_window = _seed_window(sim)              # one pass over the spec, before anything runs
+
+    def _gate(o):
+        cls = get_operator(o.op, variant=o.impl)
+        after = int(o.params.get("after_frame", 0))
+        before = int(o.params.get("before_frame", 1 << 30))
+        every = max(1, int(o.params.get("every", 1)))
+        if getattr(cls, "KIND", None) == "seed":
+            return (0, min(before, seed_window), 1)
+        return (after, before, every)
+
+    inst = [(o.op,
+             get_operator(o.op, variant=o.impl)({**o.params, "to": o.to, "from": o.frm, "_at": o.on.set}, device),
+             o.on,
+             _gate(o))                                   # multi-rate cadence: run only when tick % every == 0
+            for o in sim.operators]
+
+    # THE OPERATORS BECOME CHILDREN OF THE HIERARCHY, so `H.parameters()` finds any tensor leaf
+    # they hold. Every operator is already an `nn.Module` -- they carry `register_buffer` and are
+    # called through `__call__` -- but until now the engine kept them in this plain list, so an
+    # operator with a fitted parameter had nowhere to be found from: a caller holding H could
+    # differentiate a loss and then have nothing to hand an optimiser. Registering them as a
+    # ModuleList costs one attribute and makes the standard torch idiom work.
+    #
+    # THE ORDER IS THE SPEC'S and is part of the contract: `H.operator_names` lines up index for
+    # index with `H.operators`, so a caller can select "the parameters of neuron_signal" without
+    # re-deriving which instance that was. For the ~146 operators holding no parameter this
+    # changes nothing at all.
+    H.operators = nn.ModuleList([ob for _nm, ob, _sel, _g in inst])
+    H.operator_names = [nm for nm, _ob, _sel, _g in inst]
+    if on_ready is not None:                  # the caller's write into operator parameters (docstring)
+        on_ready(H)
+
+    # WHICH SCATTER CLEARS THE SHARED GRID, decided once, here, instead of every substep.
+    #
+    # Several particle sets can scatter into one `mpm_grid` -- that is what makes a composed cell
+    # one body rather than several passing through each other -- so the FIRST scatter of a substep
+    # must zero the grid and every later one must add to it. Answering that at run time -- comparing
+    # a counter on the Hierarchy against a stamp on the field -- works, but
+    # it is a per-substep side effect, and a side effect is exactly what a replayed CUDA graph
+    # cannot reproduce: the replay would re-run whichever branch was live at capture time.
+    #
+    # It never needed to be dynamic. The engine binds the i-th OCCURRENCE of a schedule token to
+    # the i-th INSTANCE of that operator, and instance order is declaration order, so "the first
+    # scatter into grid G" is a fixed property of the spec. Stamped on the instance, it is a python
+    # constant the graph can bake in.
+    _first_into = set()
+    for _nm, _ob, _sel, _g in inst:
+        if _nm not in ("mpm_scatter", "p2g"):
+            continue
+        _grid = getattr(_ob, "to", "mpm_grid")
+        _ob._zeroes_grid = _grid not in _first_into
+        _first_into.add(_grid)
+
+    rec_index, rec_sets, occ_sets, rec_state, rec_mesh, fstride, rec_fields = _setup_recording(sim, H)
+    # LIVE BUFFERS ON H, so an interrupted run can still be assembled -- see _assemble.
+    # THE SALVAGE HANDLE. `run_one.py:576` does `_E._assemble(Hf, *Hf._rec, n_rows=_rows)` when a
+    # run is stopped early, so this tuple is a POSITIONAL contract with a caller outside this file:
+    # `rec_mesh` is passed by keyword and NOT added here, because inserting it would silently shift
+    # `rec_fields` into the `n_rows` slot and every salvaged run would come back with one row.
+    H._rec = (sim, rec_sets, occ_sets, rec_state, rec_fields)
+    H._rec_mesh = rec_mesh                      # salvage reaches it by name, not by position
+    H._rec_index = rec_index          # tick -> row, so a salvage can truncate
+    _print_run_summary(sim, H)
+
+    # THE i-th TOKEN RUNS THE i-th INSTANCE. Matching by NAME alone ran every instance of an
+    # operator at every schedule position bearing that name, so a spec carrying an operator TWICE
+    # applied the active one TWICE PER TICK -- two tokens, each scanning both instances. With one
+    # instance (almost every spec) the two rules are identical; with two they differ by a factor of
+    # two on the physics.
+    #
+    # THE FAILURE THIS PREVENTS. A composition split into two stages -- the same operator at
+    # two parameter settings with disjoint frame windows, which is the only way this vocabulary can
+    # express a parameter that CHANGES partway through -- integrated its reaction-diffusion and its
+    # mechanics at double rate from frame 0: the surface was self-intersecting by frame 25 and the
+    # enclosed volume reached 3e6 by frame 300. The windows were correct and the gate was correct;
+    # each token was simply running both instances and only the in-window one did anything.
+    #
+    # IT ALSO AFFECTS THE TWO-SPECIES SPECS ALREADY ON DISK, which carry two `cell_chem_diffuse`,
+    # two `cell_chem_react` and two `cell_chem_seed` with no windows at all: both instances were
+    # meant to run once each per tick and each has been running twice.
+    #
+    # AND THE i-th TOKEN RUNS THE i-th *LIVE* INSTANCE. Binding to declaration order alone is right
+    # only while every instance is in its window. The whole point of carrying an operator twice is
+    # that the two windows are DISJOINT, so at any tick exactly one is live -- and a schedule that
+    # names the token once (the natural way to write "one grid solve per substep, with the parameter
+    # changing at frame 400") bound occurrence 0 to instance 0 forever and NEVER RAN INSTANCE 1.
+    #
+    # The positive instance is then called on every substep and the negative one never: the
+    # second stage of a two-stage run does not merely do the wrong thing, it does not exist. And
+    # because
+    # `mpm_grid_update` is the step that divides momentum by mass, the run also lost its grid solve
+    # entirely for the whole second half.
+    #
+    # Filtering by the window makes the one-token spelling mean what it reads as, and changes
+    # nothing where every instance is live: with two ungated `cell_chem_diffuse` and two tokens the
+    # live list is the declaration list.
+    _seen_this_tick = {}
+
+    # THE WARM-UP (2026-09-28): `W` ticks run BEFORE the recorded frames -- see `Spec.warmup`. Frame gates and
+    # multi-rate strides read the RECORDED-FRAME clock f = tick - W, so a spec's `after_frame` / `every` keep
+    # meaning recorded frames; during the warm-up (f < 0) a window reads as frame 0 and a stride as f.
+    _W = [0]
+
+    def _gf(tick):
+        return tick - _W[0]
+
+    def _live_ids(tick):
+        """Instance indices whose frame gate is open at `tick`, in declaration order."""
+        _f = _gf(tick); _fw = max(_f, 0)
+        return tuple(_j for _j, (_nm, _ob, _sel, (_a, _b, _e)) in enumerate(inst)
+                     if _a <= _fw < _b and (_e <= 1 or _f % _e == 0))
+
+    def _tokens_live(tick):
+        by = {}
+        for _j in _live_ids(tick):
+            by.setdefault(inst[_j][0], []).append(_j)
+        return by
+
+    _by_token_all = {}
+    for _i, (_nm, *_rest) in enumerate(inst):
+        _by_token_all.setdefault(_nm, []).append(_i)
+    _by_token = _tokens_live(0)
+
+    # AN OPERATOR THE SCHEDULE NEVER NAMES ENOUGH TIMES IS A SET LEFT OUT OF THE PHYSICS.
+    #
+    # The binding above is positional: the i-th OCCURRENCE of a token takes the i-th INSTANCE. So
+    # a model with four material sets declares four `mpm_scatter`, and a schedule naming the token
+    # three times runs three of them -- the fourth set never scatters into the grid, never gathers
+    # from it, and simply has no dynamics. Nothing raises: three scatters is a legal schedule, and
+    # a set that does not move is a legal set.
+    #
+    # It cost a full debugging session on the Platynereis cilia. The shafts had exactly 0.00000
+    # momentum at every frame; the torque driving them was correct, its invariant was verified to
+    # 1e-8 in the running process, the command reaching them was a clean +-0.05 -- and they were
+    # not in the schedule. Widening them from 1.2 um to 6 um changed nothing, because the width
+    # was never the problem.
+    #
+    # A warning and not an error: naming a token fewer times than it is declared is legitimate
+    # when the extra instances are gated off by a window (the `_n < len(_all)` case below), and
+    # refusing it would break those specs. But it should never be SILENT.
+    try:
+        from collections import Counter as _C
+        _named = _C()
+        for _st in (sim.schedule or []):
+            if isinstance(_st, dict):
+                for _t in (_st.get("steps") or []):
+                    _named[_t] += 1
+            else:
+                _named[str(_st)] += 1
+        for _tok, _all_i in _by_token_all.items():
+            _n_named = _named.get(_tok, 0)
+            if _n_named < len(_all_i):
+                _sets = ", ".join(str(inst[_j][0]) if not isinstance(inst[_j][0], str)
+                                  else str(getattr(inst[_j][1], "at", "?"))
+                                  for _j in _all_i[_n_named:])
+                warn(f"[warn] schedule names {_tok!r} {_n_named} time(s) but {len(_all_i)} are "
+                      f"declared: {len(_all_i) - _n_named} instance(s) will never run"
+                      + (f" (at: {_sets})" if _sets else "")
+                      + ". If those are not gated by a window, that set is out of the physics.")
+    except Exception:                                                # noqa: BLE001
+        pass
+
+    # STATIC STORAGE FOR THE SUBSTEP'S DELTA SNAPSHOT.
+    #
+    # The delta accumulator is rebound constantly: `zero_delta` builds fresh zeros every TICK
+    # (models/base.py:501), `add_delta` does `self._delta[k] = self._delta[k] + d` (:517), and the
+    # substep loop below used to clone the whole dict again on every SUBSTEP. Values were always
+    # right; addresses were never stable.
+    #
+    # That is fine for eager and fatal for a captured CUDA graph, which bakes in the address it saw
+    # at capture time -- `mpm_scatter` reads the parent's delta through `H.delta(pn)` on every
+    # substep, so a replay would read whatever tensor the capture happened to see and quietly
+    # ignore gravity thereafter. These two dicts are allocated once and refilled in place, so the
+    # tensor a captured region reads is the tensor the engine keeps writing.
+    #
+    # BYTE-IDENTICAL, because it changes storage and not values: the substep still sees exactly the
+    # frame-level delta snapshot it saw before, restored before each substep.
+    _static_d: dict = {}
+    _static_b: dict = {}
+    _graph = {}          # (id(step), live ids) -> torch.cuda.CUDAGraph, or False once refused
+    _graph_sigs = {}     # the same key -> the buffer identities the graph was captured against
+    _refused_said = set()  # id(step) whose refusal has been printed already
+    _gate_said = set()     # (id(step), live ids) already checked for a step the gate emptied
+
+    # ------------------------------------------------------------------ torch.compile, opt-in
+    # `{substep_dt: X, steps: [...], compile: true}` -- the flag lives on the SUBSTEP BLOCK because
+    # that is the only schedule entry that is a dict, and because it is where the cost is. A
+    # profiled MPM cell (13,500 particles, 96^3 grid, 15 substeps) spent 153 ms a frame of which
+    # 148 was the four operators in that block, and almost none of it was arithmetic: the batched
+    # 3x3 SVD was 18 ms, every grid allocation and index_add_ together under 2 ms, and the rest was
+    # roughly sixty individually-launched CUDA kernels per operator call, paid 30 times a frame.
+    # That is precisely the cost a fusing compiler removes, and precisely the cost that no amount
+    # of shrinking the grid or the particle count touches.
+    #
+    # OPT-IN, AND IT MUST STAY OPT-IN. Dynamo fuses and reorders floating-point work, so a compiled
+    # run is NOT bit-identical to the same spec uncompiled. The promotion suite's whole gate is
+    # byte-identity, so a spec carrying this flag can never be a twin; the warning says so out loud
+    # rather than leaving it to be discovered by a red row.
+    # torch.compile IS INSTALLED AFTER THE FIRST TICK, not at build. Every MPM operator resolves
+    # its run-constant predicates on its FIRST call ("does this set contain liquid / snow", the CSF
+    # guard) -- one `bool(t.any())` behind a cache. Wrapping at build meant dynamo traced that
+    # first call and broke the graph there: measured 13 graph breaks and 18 separate graphs for
+    # four operators, one break per predicate, permanently, because the branch stays in the traced
+    # code. Letting tick 0 run eager resolves every cache, so tick 1 compiles a body with plain
+    # python bools in it and no syncs at all. Same reason capture waits for tick 1.
+    _compile_done = [False]
+
+    def _install_compile():
+        if _compile_done[0]:
+            return
+        _compile_done[0] = True
+        _compiled = []
+        for _step in sim.schedule:
+            if not (isinstance(_step, dict) and _step.get("compile")):
+                continue
+            _mode = str(_step.get("compile_mode", "default"))
+            # THE THREE THINGS DYNAMO ASKS FOR BY NAME when it traces this operator set. Left at their
+            # defaults, compiling was SLOWER than eager (164 vs 156 ms/frame measured), because none of
+            # what follows is a fusion failure -- it is the tracer bailing out and re-tracing.
+            #
+            #   (capture_scalar_outputs IS NOT SET, and that is deliberate. `mpm_gather` reads the
+            #   domain box with `[float(b) for b in H.world_size]`; `float()` on a tensor element is
+            #   `.item()` and dynamo breaks the graph there. Turning the flag on makes it an UNBACKED
+            #   SYMBOLIC FLOAT, and inductor in this torch/triton then emits a Triton kernel that
+            #   references a symbol it never defined -- `NameError('zuf0 is not defined')`, a hard
+            #   compile failure, not a slowdown. The cause is fixed at the source instead: the box is
+            #   constant for a run, so `mpm_gather` caches it on the instance and the `float()` is
+            #   traced once rather than every call.)
+            #
+            #   allow_unspec_int_on_nn_module -- dynamo treats an INTEGER ATTRIBUTE of an nn.Module as
+            #   a compile-time constant. `mpm_scatter` reads `H.micro`, the shared-grid stamp, which
+            #   advances every substep, so every substep looked like a new constant and triggered a
+            #   fresh compile: `last reason: H.micro == 9`. This is a self-inflicted wound from the
+            #   accumulate fix and this flag is its cure -- the counter becomes an input, not a
+            #   constant.
+            #
+            #   recompile_limit -- the polar decomposition does `U[det(U) < 0, :, -1] *= -1`, a boolean
+            #   mask whose length is DATA-DEPENDENT (how many matrices are improper rotations, which
+            #   changes as the body deforms). Every new count is a new shape: `___stack2 size mismatch
+            #   at index 0, expected 13, actual 15`. Eight of those exhausts the default limit and the
+            #   function falls back to eager FOREVER, having paid for eight compiles first. Raising the
+            #   limit lets the common counts settle into a cache instead.
+            import torch._dynamo as _dyn
+            _dyn.config.allow_unspec_int_on_nn_module = True
+            _dyn.config.recompile_limit = max(int(getattr(_dyn.config, "recompile_limit", 8)),
+                                              int(_step.get("compile_recompile_limit", 64)))
+            if _step.get("compile_verbose"):
+                _dyn.config.verbose = True                        # full graph-break provenance
+            else:
+                # THE WARNINGS ARE NOT ACTIONABLE ONCE THE FLAGS ABOVE ARE SET, and they printed
+                # thirty lines of stack over the progress bar on every run. `compile_verbose: true`
+                # brings them back when the question is why a graph broke.
+                import logging
+                for _lg in ("torch._dynamo", "torch._inductor", "torch._dynamo.convert_frame"):
+                    logging.getLogger(_lg).setLevel(logging.ERROR)
+                import warnings as _w
+                _w.filterwarnings("ignore", message=".*TensorFloat32.*")
+                _w.filterwarnings("ignore", message=".*fp32_precision.*")
+            for _tok in _step.get("steps", []):
+                for _j in _by_token.get(_tok, []):
+                    if _j in [c[0] for c in _compiled]:
+                        continue
+                    _ob = inst[_j][1]
+                    try:
+                        # THE BOUND METHOD, not the module. `torch.compile(module)` returns a NEW
+                        # OptimizedModule, which would have to be substituted back into `inst` and
+                        # would break every `getattr(ob, ...)` the loop does on the original (EMIT,
+                        # INTEGRAND, MAY_MUTATE_INTEGRATED_STATE). Compiling `ob.forward` and storing
+                        # it as an instance attribute leaves the object itself untouched, and
+                        # `nn.Module.__call__` looks `self.forward` up on the instance first.
+                        _ob.forward = torch.compile(_ob.forward, mode=_mode, dynamic=False)
+                        _compiled.append((_j, _tok))
+                    except Exception as _e:                      # no triton, unsupported backend, ...
+                        warn(f"torch.compile unavailable for {_tok!r} ({type(_e).__name__}: {_e}); "
+                             f"running it eager")
+        if _compiled:
+            warn(f"torch.compile ON for {len(_compiled)} operator instance(s): "
+                 f"{', '.join(t for _i, t in _compiled)} (mode={_mode}). Compiled arithmetic is fused "
+                 f"and reordered, so this run is NOT bit-identical to the same spec uncompiled -- it "
+                 f"cannot be used as a promotion twin. The first few frames pay compilation.")
+
+    def _run_token(token, tick):
+        """Run the operator instance this schedule position names, enforcing the first-tick
+        integration-invariant guard on non-opted-out operators."""
+        _n = _seen_this_tick.get(token, 0)
+        _seen_this_tick[token] = _n + 1
+        _idx = _by_token.get(token) or []                 # the LIVE instances, in declaration order
+        _all = _by_token_all.get(token) or []             # every declared instance of that name
+        # THREE CASES, and the middle one is the one a live filter makes common.
+        #   _n < len(_idx)   the i-th occurrence takes the i-th live instance. The normal path.
+        #   _n < len(_all)   the schedule names it as often as it is DECLARED, but some of those
+        #                    instances are gated off this tick. The extra occurrences run NOTHING --
+        #                    they belong to the windows that are closed. Falling back to "every live
+        #                    instance" here would re-run the live one, and a two-stage spec written
+        #                    the explicit way (the token twice, one per window) would apply its
+        #                    surface tension TWICE PER SUBSTEP for the whole run.
+        #   otherwise        the schedule genuinely names it more often than it is declared, e.g. a
+        #                    single operator repeated within a substep. Old behaviour: every live
+        #                    instance, on each occurrence.
+        _want = ({_idx[_n]} if _n < len(_idx)
+                 else set() if _n < len(_all)
+                 else set(_idx))
+        for _j, (nm, ob, sel, (after_frame, before_frame, every)) in enumerate(inst):
+            if nm != token or _j not in _want:
+                continue
+            # ROW 0 IS THE STATE AFTER ONE PASS, on purpose. Making tick 0 the INITIAL CONDITION --
+            # skipping every kind but `seed`/`aggregate` on it, so the first recorded row shows what
+            # the run started from rather than the seeded state plus one update -- reads well and
+            # desynchronises the two recorded series:
+            # positions are written on every tick including 0, while `topo_record` is `KIND:
+            # structural` and was therefore skipped on tick 0 -- 601 position rows against 600
+            # topology rows. `run_one.py`'s D3 guard caught it on 9 sides of the twin suite with
+            # "positions=601 frames but topology=600", and D3 exists because the clamp it replaced
+            # (`hist[min(t, len(hist)-1)]`) once pairs one frame's coordinates with another frame's
+            # connectivity and produced a phantom "97% hollow / global buckling" result believed for
+            # days. THE INITIAL-CONDITION ROW IS STILL WANTED -- the observation that made the case
+            # for it stands (on myosin_mesh_x20, row 0's myosin already read 1.037 and 1.827 against
+            # the 1.0 every junction is born with, so the first frame of every movie was a frame of
+            # physics presented as the initial condition). It has to come back with the recorders
+            # included on tick 0, not excluded, so that both series start together.
+            if not (after_frame <= max(_gf(tick), 0) < before_frame):
+                continue                                 # engine-level frame gate (skip = no delta, no RNG drawn)
+            if every > 1 and _gf(tick) % every != 0:
+                continue                                 # multi-rate: run this operator only every `every` ticks
+            snap = ({n: l.state.clone() for n, l in H.levels.items()}
+                    if tick == 0 and not getattr(ob, "MAY_MUTATE_INTEGRATED_STATE", False) else None)
+            H._active_op = nm                        # so `H.gather` can record WHO walked a relation
+            deltas = ob(H, _selector_mask(H, sel))   # call the operator: forward() runs, returns {set: delta} (or {})
+            # `INTEGRAND` IS THE OPERATOR'S DEFAULT BLOCK, NOT ITS ONLY ONE. It is a class attribute,
+            # so before this it was applied to EVERY delta the operator returned: one operator could
+            # write `pos` OR `chem`, never both. That is a limit on the ENGINE and not on any
+            # mechanism, and it is what a cell with two independent surfaces runs into -- an
+            # apico-basal `cell_mechanics` has one energy whose gradient falls on two blocks of the
+            # same set (the mid-surface `pos` and the apico-basal separation), and splitting it into
+            # two operators would mean differentiating the same energy twice and calling the halves
+            # separate mechanisms.
+            #
+            # So a returned KEY may now be `(set, block)` as well as a bare `set`. Nothing else
+            # moves: `Hierarchy.add_delta` has always taken a per-delta `block` and routes a
+            # non-coordinate one into `_delta_blocks`, which `_integrate` walks for every set
+            # unconditionally. An operator that returns bare set keys is byte-identical, because
+            # the bare branch is the old line verbatim.
+            #
+            # NOT A `wall` SET, and the difference is not cosmetic. `_integrate` iterates
+            # `H.emit_order`, built by `_resolve_emit` from each operator's DECLARED set, so a delta
+            # returned for a set no operator is declared `at:` is never integrated -- it sits in
+            # `H._delta` and is wiped by the next `zero_delta`. A second surface put on its own set
+            # would therefore have been FROZEN while every gate row measured it.
+            default_block = getattr(ob, "INTEGRAND", None)   # None = the set's coordinate block
+            for key, d in deltas.items():            # break here to inspect `deltas`; empty for EMIT=None ops
+                if isinstance(key, tuple):
+                    lvlname, blk = key               # explicit per-delta block
+                else:
+                    lvlname, blk = key, default_block
+                H.add_delta(lvlname, d, blk)         # record each returned delta for end-of-tick integration
+
+            if snap is not None:
+                for n, before in snap.items():
+                    # NaN-AWARE (2026-10-08): torch.equal is False for an unchanged state holding a NaN, which made a
+                    # NaN seeded state (a NaN learnable injected at on_seeded) read as an operator writing the state
+                    after = H.levels[n].state
+                    if before.shape != after.shape or not bool(((before == after)
+                                                                | (before.isnan() & after.isnan())).all()):
+                        raise RuntimeError(
+                            f"operator {nm!r} wrote the integrated state of set {n!r} "
+                            f"directly. A dynamics operator must RETURN a delta (the engine "
+                            f"integrates it); only structural / derived-readout operators "
+                            f"(MAY_MUTATE_INTEGRATED_STATE) may write state. (integration invariant)")
+
+    # THE WARM-UP LENGTH: `general.warmup` when declared, else the longest settle window a seed declared
+    # (`m["ref_frame"]`, written by `seed_mesh`), else 0. The record's keys move by W, so row 0 is tick W.
+    _wd = getattr(sim, "warmup", None)
+    if _wd is None:
+        _wd = max([int((getattr(_l, "_mesh", None) or {}).get("ref_frame", 0) or 0) for _l in H.levels.values()] + [0])
+    _W[0] = W = max(int(_wd), 0)
+    H.warmup = W
+    if W > 0:
+        _shifted = {t + W: i for t, i in rec_index.items()}
+        rec_index.clear(); rec_index.update(_shifted)
+        print(f"[engine] warm-up: {W} tick(s) before frame 0, not recorded -- the settle window runs with the "
+              f"size rules idle and `cell_grow` holding (general.warmup: 0 restores the recorded window)", flush=True)
+    ticks = range(W + sim.n_frames + 1)
+    if progress:                                     # live progress bar over the simulated frames
+        try:
+            from tqdm import tqdm
+            # `dynamic_ncols` OVERRIDES `ncols`: it re-reads the terminal width on every refresh, so a
+            # fixed width set beside it is silently ignored and the bar fills the window.
+            # `leave=True` because the finished bar is the record of how long the run took and how
+            # many frames it got through; erasing it on completion throws that away and leaves the
+            # log with no evidence the loop ran at all.
+            # ms/FRAME IN THE BAR, not just frame/s. Every performance comparison in this repo is
+            # quoted in ms/frame -- the benchmark, the profiler, the operator docstrings -- so a bar
+            # that only shows frame/s has to be converted in the reader's head, and 1.51 frame/s
+            # against "we measured 461 ms" is a needless subtraction. tqdm's `rate` is frames per
+            # second when it is going fast and seconds per frame when it is going slow, which makes
+            # it worse: the unit silently flips mid-run.
+            ticks = tqdm(ticks, desc=f"[generate] {sim.name}", unit="frame", ncols=150, leave=True,
+                         bar_format="{desc}: {percentage:3.0f}%|{bar}| {n_fmt}/{total_fmt} "
+                                    "[{elapsed}<{remaining}{postfix}]")
+        except ImportError:
+            pass
+    # the tape is OFF unless the caller asked for it (see the docstring): generation pays no
+    # memory for a graph it will never traverse, and the inverse half asks explicitly.
+    frame_ms: list[float] = []
+    # THE FRAME DURATION PER TICK, when the spec schedules one (`general.dt_schedule`); None keeps
+    # `H.dt == sim.dt` for every tick, exactly as before. Tick 0 takes the first segment's duration.
+    _dt_of = None
+    if getattr(sim, "dt_schedule", None):
+        _dt_of = [float(d) for f, d in sim.dt_schedule for _ in range(int(f))]
+    with (contextlib.nullcontext() if grad else torch.no_grad()):
+        for tick in ticks:                           # one tick = one pass of the schedule + integrate
+            # THE COST OF THE TICK, MEASURED WHERE IT IS PAID. The movie stamps a `ms/frame` and
+            # neither pass could honestly say "compute": the LIVE one times its own loop, which
+            # renders, and the REPLAY one times the renderer and says so. So a figure meant to
+            # report how expensive the physics is reported how expensive the picture was.
+            #
+            # Recorded per tick and carried into the trajectory, so the replay -- the pass that
+            # writes the movie that is kept -- can stamp the number the run actually took. It is
+            # WALL time and includes the recorder; the alternative, timing only the schedule, would
+            # report a figure no one can reproduce from the outside.
+            _t_tick = time.perf_counter()
+            if tick == 1:
+                _install_compile()                   # after tick 0 has warmed every run-constant cache
+            if progress and tick and hasattr(ticks, "set_postfix_str") and tick % 8 == 0:
+                # THE RECENT RATE, NOT THE CUMULATIVE AVERAGE. `elapsed / tick` folds the one-off
+                # startup -- building the hierarchy, the CUDA-graph capture, a torch.compile -- into
+                # every reading: on a 945k-particle run that is ~4 s of capture, so frame 39 reported
+                # 641 ms where the steady rate was 553. tqdm's own `rate` is an exponential moving
+                # average over recent iterations, so it converges within a few frames and reads the
+                # same as the benchmark does.
+                _r = ticks.format_dict.get("rate")
+                if _r:
+                    ticks.set_postfix_str(f"{1000.0 / _r:.1f} ms/frame  {_r:.2f} fps",
+                                          refresh=False)
+            H.frame = tick                           # current tick (read by prescribed fields, e.g. playback)
+            H.frame_t.fill_(float(tick))             # the same, reachable from inside a CUDA graph
+            if _dt_of is not None:                   # `general.dt_schedule`: this frame's own duration
+                H.dt = _dt_of[min(tick, len(_dt_of) - 1)]
+            # THE MICRO-STEP COUNTER. A shared accumulator field -- the MPM grid is the one in the
+            # library -- has to know when a fresh solve begins, because the FIRST operator writing
+            # into it must clear it and every later one must add. Neither the tick nor the substep
+            # index alone says that (a flat schedule has no substeps; a substep block has many per
+            # tick), so what the field compares against is a single number that advances at both.
+            H.micro = getattr(H, "micro", 0) + 1
+            H.zero_delta()
+            _seen_this_tick.clear()                  # token occurrence -> instance, per tick
+            _by_token.clear()
+            _by_token.update(_tokens_live(tick))     # ... and only instances whose window is open
+            for step in sim.schedule:                # operators accumulate per-set deltas
+                # a micro-loop `{substep_dt: <dt_sub>, steps: [...]}`: run the inner operators
+                # once per substep at `dt_sub` (e.g. the MPM strain->P2G->grid->G2P cycle). The
+                # count is derived as round(general.dt / dt_sub), so `general.dt` is the sim-time
+                # advanced per FRAME (lower it for slow-motion; dt_sub stays CFL-stable). Deltas
+                # accumulated by the OUTER schedule (gravity) persist across it.
+                if isinstance(step, dict) and "substep_dt" in step:
+                    H.sub_dt = float(step["substep_dt"])
+                    count = max(1, round(H.dt / H.sub_dt))   # H.dt == sim.dt unless dt_schedule
+                    # THE OUTER DELTA IS THE SUBSTEP'S BASELINE, RESTORED EACH TIME. `zero_delta` runs
+                    # once per TICK, so an operator that returns a force from INSIDE this block used to
+                    # add to what its own previous substep left behind: measured on a four-substep
+                    # frame, `mpm_scatter` saw a body force of 20 / 40 / 60 / 80 where the same operator
+                    # at frame level gives a flat 20 / 20 / 20 / 20. Anything stiff enough to need
+                    # per-substep evaluation was therefore ramping 1x to Nx within every frame -- the
+                    # ECM prototype's `bm_contact` did exactly that.
+                    # Snapshotting and restoring keeps the documented behaviour intact (a frame-level
+                    # delta, e.g. gravity, persists across the loop and is seen identically by every
+                    # substep) and makes an inner-schedule force what it reads as: recomputed at the
+                    # substep's own positions, applied once per substep.
+                    # THE PERSISTENT DELTA BUFFERS ARE FOR CAPTURE AND COMPILE, AND THEY ARE
+                    # IN-PLACE. Under grad they are the wrong thing twice over: `copy_` into a
+                    # static buffer overwrites a tensor a later backward needs (measured: a
+                    # [12500, 3] at version 78 against an expected 1), and there is no captured
+                    # graph to hold addresses for in the first place, since capture is off whenever
+                    # a tape is being kept. The snapshot/restore below still runs -- it is what
+                    # makes a frame-level delta persist across the substep loop -- it just uses the
+                    # clones directly instead of installing them into reused storage.
+                    _static_ok = not torch.is_grad_enabled()
+                    _d0 = {k: v.clone() for k, v in H._delta.items()}
+                    _b0 = {k: {b: t.clone() for b, t in d.items()}
+                           for k, d in H._delta_blocks.items()}
+                    # install the persistent buffers, refilled from this tick's snapshot
+                    for _k, _v in (_d0.items() if _static_ok else ()):
+                        _t = _static_d.get(_k)
+                        if _t is None or _t.shape != _v.shape or _t.device != _v.device:
+                            _t = _static_d[_k] = torch.empty_like(_v)
+                        _t.copy_(_v)
+                    for _k in [k for k in _static_d if k not in _d0]:
+                        del _static_d[_k]                       # a set that stopped emitting
+                    for _k, _d in (_b0.items() if _static_ok else ()):
+                        _sb = _static_b.setdefault(_k, {})
+                        for _b, _t2 in _d.items():
+                            _c = _sb.get(_b)
+                            if _c is None or _c.shape != _t2.shape or _c.device != _t2.device:
+                                _c = _sb[_b] = torch.empty_like(_t2)
+                            _c.copy_(_t2)
+                    # THE BLOCK DELTAS OF THE LAST TICK ARE NOT THIS TICK'S BASELINE (exp29, 2026-10-21, TRAPS T-81). `_static_b` outlives the tick
+                    # and is installed as `H._delta_blocks` below; an operator AFTER this block (a chemistry on the cell set of an MPM body) adds
+                    # its delta into it, and `zero_delta` does not reach it (it rebinds `H._delta_blocks` to a fresh dict, which this line then
+                    # replaces). Entries `_b0` does not hold were left over from the previous tick, so each tick's chemistry was added to the sum
+                    # of every earlier tick's: a first-order block integrated like an acceleration (the Gray-Scott substrate of 40 MPM cells went
+                    # negative at frame 16 and non-finite at frame 83). `_static_d` has always dropped what stopped emitting; the block buffers now do too.
+                    for _k in [k for k in _static_b if k not in _b0]:
+                        del _static_b[_k]
+                    for _k, _d in _b0.items():
+                        for _b in [b for b in _static_b.get(_k, {}) if b not in _d]:
+                            del _static_b[_k][_b]
+                    if _static_ok:
+                        H._delta = _static_d
+                        H._delta_blocks = _static_b
+                    # ------------------------------------------------ CUDA graph capture, opt-in
+                    # THE SUBSTEP IS 415 KERNEL LAUNCHES AND ~30 us OF GPU WORK PER LAUNCH-BOUND
+                    # FRAME. Profiling says the GPU is idle 60% of the wall clock waiting for the
+                    # CPU to queue the next kernel; the four operators cannot be made to issue
+                    # fewer kernels without changing the discretisation. A captured graph replays
+                    # the whole substep as ONE launch, which is the only lever that reaches the
+                    # idle time. Measured 2.36x end to end on a two-set cell.
+                    #
+                    # WHY MANUAL CAPTURE AND NOT torch.compile. Per-operator compilation cannot
+                    # chain into one graph (each OptimizeContext bumps the cudagraph generation),
+                    # `mode="reduce-overhead"` fails outright on operators that write into
+                    # persistent buffers, and the merged-region form measured SLOWER than eager for
+                    # 55 s of compilation. Manual capture is also the only variant that is
+                    # bit-identical to its eager twin, which is what a promotion gate can check.
+                    # CAPTURE IS THE DEFAULT, and refusing is quiet unless it was ASKED for.
+                    # It is bit-identical to eager (proven over 60 ticks on every buffer, not just
+                    # positions) and it refuses on anything it cannot capture, so defaulting it on
+                    # costs nothing and means a spec does not have to know the engine has a graph.
+                    # A spec that writes `capture: true` and cannot have it gets the full reason in
+                    # yellow; one that never mentioned it gets one line, because a warning nobody
+                    # asked for on 100 specs is a warning nobody reads.
+                    # ONE GRAPH PER GATE CONFIGURATION, not one graph per block.
+                    #
+                    # A captured graph is a fixed list of kernels. The frame gate is python, so it
+                    # is evaluated once -- AT CAPTURE -- and the replay carries whatever was live at
+                    # tick 1 for the rest of the run. Keyed on `id(step)` alone, every
+                    # `before_frame` / `after_frame` / `every` on an operator INSIDE a substep block
+                    # was therefore silently inert from tick 1 on, which is precisely the class of
+                    # failure `_capture_refusals` exists to prevent and the one thing it did not
+                    # check. Measured on si_two_drops3d_cycle with the schedule naming the token
+                    # twice, so the binding above was already correct: eager gave 312 / 416 calls to
+                    # the two windows, captured gave 108 / 0.
+                    #
+                    # Refusing capture whenever a gated operator appears would cost the 2.36x on
+                    # every staged spec. Putting the live set in the key instead costs one extra
+                    # capture per configuration -- two for a two-stage run -- and each replay is
+                    # then a graph of exactly the operators that were live when it was taken.
+                    _blk_toks = set(step.get("steps", []))
+                    _cap_key = (id(step), tuple(_j for _j in _live_ids(tick)
+                                                if inst[_j][0] in _blk_toks))
+                    _cap_asked = "capture" in step
+                    # A GATE THAT EMPTIES A STEP OF THE CYCLE SAYS SO.
+                    #
+                    # A frame window that closes with nothing to replace it does not leave the
+                    # substep doing the same thing more weakly -- it DELETES that step. On
+                    # si_two_drops3d_cycle the only `mpm_grid_update` went out of window at frame
+                    # 400 and the second half of the run had no grid solve at all: the momentum was
+                    # never divided by the mass and no wall was ever applied, so the fluid simply
+                    # stopped. It looked exactly like "the second stage did nothing", which is a
+                    # description of the symptom and not of the cause.
+                    #
+                    # This costs one set difference per configuration change, and it is the only
+                    # thing standing between a mis-windowed spec and a run that finishes, renders,
+                    # and is wrong.
+                    if _cap_key not in _gate_said:
+                        _gate_said.add(_cap_key)
+                        _dead = [t for t in step.get("steps", [])
+                                 if t not in {inst[_j][0] for _j in _cap_key[1]}]
+                        if _dead:
+                            warn(f"at frame {tick} the substep block has NO live instance of "
+                                 f"{_dead} -- every declared one is outside its "
+                                 f"after_frame/before_frame window, so that step is absent from "
+                                 f"the cycle from here on. If this is a staged run, the stage that "
+                                 f"takes over is missing or its window does not start at {tick}.")
+                    _blk_sets = _block_sets(step, inst)
+                    if step.get("capture", True) and _graph.get(_cap_key) is None and tick >= 1:
+                        _why = _capture_refusals(sim, H, step, inst)
+                        if _why or not str(device).startswith("cuda"):
+                            _graph[_cap_key] = False
+                            _msg = _why or ["device is not cuda"]
+                            _said = id(step) in _refused_said       # say it once per BLOCK, not
+                            _refused_said.add(id(step))             # once per gate configuration
+                            if _said:
+                                pass
+                            elif _cap_asked:
+                                warn("capture refused for this substep block; running it eager:\n"
+                                     + "\n".join(f"    - {w}" for w in _msg))
+                            else:
+                                print(f"[engine] substep not captured ({_msg[0].split(';')[0]})",
+                                      flush=True)
+                        else:
+                            # THE CAPTURE HAPPENS ON THE CURRENT DEVICE, not on the tensors'.
+                            # `torch.cuda.graph()` and `torch.cuda.CUDAGraph()` both bind to
+                            # whatever `torch.cuda.current_device()` says, which is 0 unless
+                            # someone set it. Running with `--device cuda:1` therefore captured an
+                            # EMPTY graph on cuda:0 -- "The CUDA Graph is empty" -- and then died
+                            # with cudaErrorStreamCaptureInvalidated. Every one of the four
+                            # operators captures cleanly once this context is right.
+                            _dev_ctx = torch.cuda.device(device)
+                            _dev_ctx.__enter__()
+                            _snap = _capture_state(H, _blk_sets)
+                            _keep = [t.clone() for t in _snap]
+                            # WARM-UP ON A SIDE STREAM is required, not hygiene: a cold capture
+                            # picks up cuBLAS/cuDNN lazy initialisation and fails.
+                            # THE DELTA BUFFERS ARE NOT IN THE SNAPSHOT, AND THEY ARE REBOUND, NOT
+                            # REFILLED. `add_delta` does `_delta[k] = _delta[k] + d`, so an operator
+                            # INSIDE this block that emits onto a set (an `mpm_acceleration` body
+                            # force -- a membrane, a contact) rebinds the dict entry to a fresh
+                            # tensor on every pass. Unrestored, the three warm-ups summed into that
+                            # entry, the capture recorded `stale + d` reading the warm-ups' sum, and
+                            # the per-substep refill below then copied the baseline into the
+                            # capture's OUTPUT instead of its input: every replay added a frozen
+                            # ~3x copy of the force at capture time. Measured (exp22, a
+                            # pre-stretched membrane collapsing on its own grid): kinetic energy 4.0
+                            # to 7.0 times the elastic energy released when captured, 1.00 eager.
+                            # So the persistent buffers are put back, refilled with this tick's
+                            # baseline, before each warm-up, before the capture and after it.
+                            _pd = dict(_static_d)
+                            _pb = {k: dict(d) for k, d in _static_b.items()}
+
+                            def _refill_deltas():
+                                for _k, _t in _pd.items():
+                                    _static_d[_k] = _t
+                                    _t.copy_(_d0[_k])
+                                for _k, _d in _pb.items():
+                                    for _b, _t in _d.items():
+                                        _static_b[_k][_b] = _t
+                                        _t.copy_(_b0[_k][_b])
+                                H._delta = _static_d
+                                H._delta_blocks = _static_b
+                            _side = torch.cuda.Stream(device=device)
+                            _side.wait_stream(torch.cuda.current_stream(device))
+                            with torch.cuda.stream(_side):
+                                for _w in range(3):
+                                    _refill_deltas()
+                                    _seen_this_tick.clear()
+                                    for token in step["steps"]:
+                                        _run_token(token, tick)
+                            torch.cuda.current_stream(device).wait_stream(_side)
+                            for _t, _k in zip(_snap, _keep):
+                                _t.copy_(_k)                    # undo the warm-up
+                            _refill_deltas()
+                            _gr = torch.cuda.CUDAGraph()
+                            _seen_this_tick.clear()
+                            with torch.cuda.graph(_gr):
+                                for token in step["steps"]:
+                                    _run_token(token, tick)
+                            for _t, _k in zip(_snap, _keep):
+                                _t.copy_(_k)                    # and undo the capture pass
+                            _refill_deltas()                    # the replay reads THESE, refilled each substep
+                            _graph[_cap_key] = _gr
+                            _graph_sigs[_cap_key] = _graph_sig(H, _blk_sets)
+                            _dev_ctx.__exit__(None, None, None)
+                            print(f"[engine] substep captured as a CUDA graph "
+                                  f"({len(step['steps'])} operators, {count} replays/frame)",
+                                  flush=True)
+                    _gr = _graph.get(_cap_key)
+                    if _gr and _graph_sig(H, _blk_sets) != _graph_sigs[_cap_key]:
+                        # A BUFFER MOVED SINCE CAPTURE. Fall back rather than replay into memory
+                        # nothing reads any more -- that failure is silent and produces a run that
+                        # looks finished and is wrong.
+                        warn("a state buffer was reallocated after the substep was captured "
+                             "(a set resized, or an operator assigned instead of copying); "
+                             "dropping the CUDA graph and continuing eager for the rest of the run")
+                        # EVERY configuration of this block, not just the live one: the buffer moved
+                        # under all of them, and a later frame window would otherwise replay into
+                        # memory nothing reads any more.
+                        for _k in [k for k in _graph if k[0] == id(step)]:
+                            _graph[_k] = False
+                        _refused_said.add(id(step))
+                        _gr = None
+
+                    for _s in range(count):
+                        # THE OCCURRENCE COUNTER RESETS EVERY SUBSTEP, not every tick. `_run_token`
+                        # binds the i-th OCCURRENCE of a token to the i-th INSTANCE of that
+                        # operator, and `_seen_this_tick` is cleared once per tick -- outside this
+                        # loop. So a substep block naming `mpm_scatter` three times for three
+                        # particle sets bound correctly on substep 0 and then ran off the end of
+                        # the instance list on every substep after it, where `_want` falls back to
+                        # ALL instances and each of the three occurrences scattered all three sets:
+                        # nine scatters per substep instead of three, on fourteen of fifteen
+                        # substeps.
+                        #
+                        # WHAT IT LOOKED LIKE, because it does not announce itself. A composed cell
+                        # of nucleus + cytosol + membrane ran with the nucleus moving and the other
+                        # two standing still while it passed through them -- the grid was being
+                        # scattered into repeatedly with duplicated momentum, so the solve was
+                        # meaningless, and the picture read as "the membrane is too weak" rather
+                        # than as a scheduling fault.
+                        #
+                        # A single-instance token is unaffected either way: with one instance,
+                        # occurrence 0 selects it and every later occurrence falls back to the same
+                        # one. Only specs declaring the SAME operator more than once inside a
+                        # substep block change, which is exactly the set that was wrong.
+                        _seen_this_tick.clear()
+                        H.micro = H.micro + 1        # a new solve: the next scatter clears the grid
+                        if _s:
+                            # REFILL, DO NOT REBIND. Same values as the clone this replaces; the
+                            # storage survives, which is what a captured graph requires.
+                            if not _static_ok:
+                                # under grad: restore by REBINDING the clones. `copy_` into reused
+                                # storage is what a backward two substeps later finds moved.
+                                H._delta = {k: v.clone() for k, v in _d0.items()}
+                                H._delta_blocks = {k: {b: t.clone() for b, t in d.items()}
+                                                   for k, d in _b0.items()}
+                            for _k, _v in (_d0.items() if _static_ok else ()):
+                                _static_d[_k].copy_(_v)
+                            for _k, _d in (_b0.items() if _static_ok else ()):
+                                for _b, _t2 in _d.items():
+                                    _static_b[_k][_b].copy_(_t2)
+                            if _static_ok:
+                                H._delta = _static_d
+                                H._delta_blocks = _static_b
+                        if _gr:
+                            _gr.replay()        # the whole substep, one launch
+                        else:
+                            for token in step["steps"]:
+                                _run_token(token, tick)
+                    H.sub_dt = None
+                    continue
+                for token in (step if isinstance(step, list) else [step]):
+                    _run_token(token, tick)
+            _integrate(H, H.dt)                      # integrate each set once, at end of tick (H.dt == sim.dt unless dt_schedule)
+            ri = rec_index.get(tick)                 # None on un-recorded ticks (strided long runs)
+            if ri is not None:
+                for name, lvl in H.levels.items():
+                    # `.detach()` matters only under grad=True, where these tensors carry a tape:
+                    # the trajectory is a RECORD, never a path for the gradient (which reaches the
+                    # caller through H). Without it, `.numpy()` raises on the first frame.
+                    if name in rec_sets:                              # spatial: the pos trajectory
+                        rec_sets[name][ri] = _rec0(lvl.get("pos")).detach().cpu().numpy()
+                    occ_sets[name][ri] = lvl.active.detach().cpu().numpy()
+                    # THE TYPE COLUMN PER ROW, for a set whose types change during the run (a
+                    # protein reservoir labels a slot with its species at birth). Kept only
+                    # when it actually changed -- see the assembly below.
+                    if getattr(lvl, "node_type", None) is not None and getattr(lvl, "_type_table", None) is not None:
+                        H._type_hist.setdefault(name, {})[ri] = lvl.node_type.detach().cpu().numpy().astype(np.int16)
+                    if name in rec_state:                            # non-pos recorded state blocks (voltage, ...)
+                        for bname, arr in rec_state[name].items():
+                            arr[ri] = _rec0(lvl.get(bname)).detach().cpu().numpy()
+                    # THE MESH IS RECORDED IF ONE EXISTS, not only if the SPEC SAID SO. `rec_mesh`
+                    # is keyed at setup from `lvl.mesh`, which `_provision_mesh` creates only when
+                    # the set declares `mesh: half_edge`. But `seed_mesh` builds its table
+                    # regardless, on the legacy private `_mesh`, so an archived spec that predates
+                    # the declaration -- most of `config/okuda/_superseded_*` -- runs a full vertex
+                    # model whose topology is NEVER RECORDED. Nothing said so: `seed_mesh` ran,
+                    # `topo_record` ran, the trajectory came out with no `__mesh_*` column at all,
+                    # the renderer fell back to a matplotlib point cloud (a drifting blue blob
+                    # where the run is a spheroid), and the twin comparison had no nF/Nv to crop by
+                    # and reported `pos_0: shape (3996, 3) vs (130004, 3)` on two runs that agree.
+                    _m = getattr(lvl, "mesh", None) or getattr(lvl, "_mesh", None)
+                    if _m is not None and getattr(_m, "snapshot", None) is not None:
+                        if name not in rec_mesh:
+                            rec_mesh[name] = []
+                            print(f"[engine] set {name!r} has a half-edge mesh but does not declare "
+                                  f"`mesh: half_edge`; recording it anyway. Add the declaration to "
+                                  f"the spec -- an undeclared mesh used to be dropped silently.",
+                                  flush=True)
+                        rec_mesh[name].append(_m.snapshot())
+            if H.fields and tick >= W and ((tick - W) % fstride == 0 or tick - W == sim.n_frames):
+                for fn, fld in H.fields.items():
+                    if not getattr(fld, "RECORD", True):     # transient scratch fields (e.g. mpm_grid) are not recorded
+                        continue
+                    rec_fields[fn].append(fld.grid.detach().to("cpu", torch.float32).numpy().copy())
+            # generic per-tick hook: lets a diagnostic capture live H state (e.g. the MPM
+            # continuum buffers F/C/Jp + the transient grid) that the trajectory does not store.
+            # ARM ANY OPERATOR THAT WANTS ITS REST STATE FROM A PARTICULAR FRAME. `mpm_anchor`
+            # gated with `after_frame` would otherwise capture whatever the run had drifted to by
+            # the time it first ran; `anchor_frame` makes that a declared choice instead.
+            for _nm, _op, _sel, _g in inst:
+                _af = getattr(_op, "anchor_frame", None)
+                if _af is not None and int(_af) == tick - W and not getattr(_op, "_armed", False):
+                    _op.capture_rest(H)
+                    _op._armed = True
+            if on_frame is not None and tick >= W:
+                on_frame(H, tick - W)
+            if tick >= W:
+                frame_ms.append((time.perf_counter() - _t_tick) * 1000.0)
+
+    out = _assemble(H, sim, rec_sets, occ_sets, rec_state, rec_fields, rec_mesh=rec_mesh)
+    out["frame_ms"] = np.asarray(frame_ms, np.float32)   # one wall-clock reading per simulated tick
+
+    if out_path is not None:
+        import zarr
+
+        def _put(g, key, data):
+            """Write one array, on zarr 2 OR zarr 3.
+
+            `Group.create_dataset(name, data=...)` is the zarr-2 spelling; zarr 3 kept the method,
+            deprecated it, and made `shape` a REQUIRED keyword -- so the call raises
+            `TypeError: AsyncGroup.create_dataset() missing 1 required keyword-only argument:
+            'shape'`. The devcontainer has zarr 2.18.7 and the cluster has 3.1.5, so every core
+            generation on the cluster died AFTER the whole simulation had run and BEFORE the npz was
+            written: 25 minutes of GPU, a `simulation.zarr` holding one empty group, and no
+            trajectory. `create_array` is the zarr-3 name; `g[key] = data` is the fallback that
+            works on both.
+            """
+            data = np.asarray(data)
+            try:
+                a = g.create_array(name=key, shape=data.shape, dtype=data.dtype)
+                a[...] = data
+                return
+            except (AttributeError, TypeError):
+                pass
+            try:
+                g.create_dataset(key, data=data)
+                return
+            except TypeError:
+                g.create_dataset(key, shape=data.shape, dtype=data.dtype)[...] = data
+
+        root = zarr.open_group(out_path, mode="w")
+        for name in H.levels:
+            g = root.create_group(name)
+            if out["sets"][name]["pos"] is not None:            # spatial: the pos trajectory
+                _put(g, "pos", out["sets"][name]["pos"])
+            _put(g, "occ", out["sets"][name]["occ"])
+            if out["sets"][name]["state"] is not None:          # non-spatial state blocks -> state/<block>
+                sg = g.create_group("state")
+                for bname, arr in out["sets"][name]["state"].items():
+                    _put(sg, bname, arr)
+            ms = out["sets"][name].get("mesh")
+            if ms:                                              # the ragged half-edge history
+                mg = g.create_group("mesh")
+                _put(mg, "offsets", np.cumsum([0] + [len(m["E_srce"]) for m in ms]))
+                _put(mg, "face_offsets", np.cumsum([0] + [int(m["nF"]) for m in ms]))
+                _put(mg, "nF", np.asarray([m["nF"] for m in ms], np.int64))
+                _put(mg, "Nv", np.asarray([m["Nv"] for m in ms], np.int64))
+                for col in ("E_srce", "E_trgt", "E_face"):
+                    _put(mg, col, np.concatenate([m[col] for m in ms]).astype(np.int64))
+                from plexus.models.mesh import mesh_row_columns
+                # THE UNION, zero-filled -- see `plexus.models.mesh.mesh_row_columns`. The
+                # intersection this replaced deleted any column absent from row 0, which is nearly
+                # all of them: `age`/`ndiv` appear when division is first allowed, `apop` when a
+                # cell is first sentenced, `scalar_n_apop` when one is first extruded.
+                _scal, _edge, _face, _fill = mesh_row_columns(ms)
+                for col in _scal:
+                    _put(mg, col, np.asarray([_fill(m, col) for m in ms], np.float64))
+                for col in _edge:
+                    _vals = [_fill(m, col) for m in ms]
+                    _put(mg, col, np.concatenate(_vals).astype(np.float32))
+                    _put(mg, col + "_offsets",
+                         np.cumsum([0] + [len(v) for v in _vals]).astype(np.int64))
+                for col in _face:
+                    _put(mg, col, np.concatenate([_fill(m, col) for m in ms]).astype(np.float32))
+        for fn, fd in out["fields"].items():
+            g = root.create_group(fn)
+            _put(g, "grid", fd["grid"])
+            _put(g, "colors", fd["colors"])
+        root.attrs.update(name=sim.name, seed=sim.seed, world=H.world_width)
+    return H, out

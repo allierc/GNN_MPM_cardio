@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+cardio/out/
+*.egg-info/
+build/
+dist/
+scripts/_jobs/
+
+# local backups and LaTeX build files
+*.bak
+docs/*.fdb_latexmk
+docs/*.fls
+docs/*.aux
+docs/*.log
+docs/*.out
